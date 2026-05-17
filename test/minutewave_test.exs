@@ -59,4 +59,18 @@ defmodule Minutewave.Dsp.PhyModemTest do
       Application.delete_env(:minutewave, :phy_modem_nif)
     end
   end
+
+  describe "application supervision" do
+    test "Minutewave.Modem.Registry is started" do
+      assert is_pid(Process.whereis(Minutewave.Modem.Registry))
+    end
+
+    test "Registry accepts via-tuple registration" do
+      name = {:via, Registry, {Minutewave.Modem.Registry, {:test_rig, :events}}}
+      {:ok, pid} = Agent.start_link(fn -> nil end, name: name)
+      assert Process.whereis(Minutewave.Modem.Registry) |> is_pid()
+      assert Registry.lookup(Minutewave.Modem.Registry, {:test_rig, :events}) == [{pid, nil}]
+      Agent.stop(pid)
+    end
+  end
 end

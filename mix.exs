@@ -20,6 +20,7 @@ defmodule Minutewave.MixProject do
 
   def application do
     [
+      mod: {Minutewave.Application, []},
       extra_applications: [:logger]
     ]
   end

@@ -28,3 +28,35 @@ defmodule MinutewaveTest do
     end
   end
 end
+
+defmodule Minutewave.Dsp.PhyModemTest do
+  use ExUnit.Case
+
+  describe "facade dispatch" do
+    test "raises a helpful error when no NIF module configured" do
+      Application.delete_env(:minutewave, :phy_modem_nif)
+
+      assert_raise RuntimeError, ~r/no NIF module configured/, fn ->
+        Minutewave.Dsp.PhyModem.unified_mod_new(:qpsk, 9600)
+      end
+    end
+
+    test "dispatches to the configured NIF module" do
+      # A fake NIF impl, just to prove dispatch reaches the right module
+      defmodule FakeNif do
+        def unified_mod_new(constellation, sample_rate, symbol_rate, carrier_freq),
+          do: {:fake, constellation, sample_rate, symbol_rate, carrier_freq}
+      end
+
+      Application.put_env(:minutewave, :phy_modem_nif, FakeNif)
+
+      assert {:fake, :qpsk, 9600, nil, nil} =
+               Minutewave.Dsp.PhyModem.unified_mod_new(:qpsk, 9600)
+
+      assert {:fake, :psk8, 19200, 4800, 1500.0} =
+               Minutewave.Dsp.PhyModem.unified_mod_new(:psk8, 19200, 4800, 1500.0)
+    after
+      Application.delete_env(:minutewave, :phy_modem_nif)
+    end
+  end
+end

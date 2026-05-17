@@ -99,6 +99,25 @@ defmodule Minutewave.Modem110D.Codec do
     Logger.debug("[Codec.TX] Input: #{length(data_bits)} data bits, rate=#{inspect(rate)}, bps=#{bits_per_symbol}")
     Logger.debug("[Codec.TX] First 16 input bits: #{inspect(Enum.take(data_bits, 16))}")
 
+    # 1a. Pad input to fill an integer number of interleaver blocks.
+    # The interleaver chunks by coded_bits(wid, interleaver, bw_khz).
+    # Working backwards: coded_bits / puncture_expansion / 2 (rate-1/2 conv) = input bits per block.
+    coded_bits_per_block = Minutewave.Modem110D.Waveforms.coded_bits(waveform, interleaver, bw_khz)
+    repeat_factor = case rate do
+      {1, 2} -> 1
+      {1, 3} -> 2
+      {1, 4} -> 2
+      {1, 6} -> 3
+      {1, 8} -> 4
+      _ -> 1
+    end
+    # coded_bits = input_bits * 2 (rate 1/2 conv) * repeat_factor (puncture)
+    input_bits_per_block = div(coded_bits_per_block, repeat_factor * 2)
+    n_blocks = max(1, div(length(bits) + input_bits_per_block - 1, input_bits_per_block))
+    target_input_length = n_blocks * input_bits_per_block
+    bits = bits ++ List.duplicate(0, target_input_length - length(bits))
+    Logger.debug("[Codec.TX] Padded to #{length(bits)} bits (#{n_blocks} block(s) of #{input_bits_per_block})")
+
     # 2. Convolutional encode (full-tail-biting per D.5.3.2.3)
     coded = ConvEncoder.encode_tail_biting(bits, k)
     Logger.debug("[Codec.TX] After conv encode: #{length(coded)} bits")

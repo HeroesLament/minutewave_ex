@@ -13,7 +13,11 @@ defmodule Minutewave.Application do
       # Per-rig control / hardware-side processes (Rig.Control implementations,
       # audio backends) register here. Separate from Modem.Registry so the
       # protocol and hardware sides have independent supervision lifecycles.
-      {Registry, keys: :unique, name: Minutewave.Rig.InstanceRegistry}
+      {Registry, keys: :unique, name: Minutewave.Rig.InstanceRegistry},
+
+      # Per-rig wire-protocol interface processes (KISS, MIL-110D-A) register
+      # here, addressed by {rig_id, :kiss | :mil110d | :mil110d_listener}.
+      {Registry, keys: :unique, name: Minutewave.Interface.Registry}
     ]
 
     opts = [strategy: :one_for_one, name: Minutewave.Supervisor]

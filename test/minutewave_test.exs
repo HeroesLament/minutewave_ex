@@ -10,9 +10,9 @@ defmodule MinutewaveTest do
     test "Audio.Backend behaviour is defined" do
       assert Code.ensure_loaded?(Minutewave.Audio.Backend)
       callbacks = Minutewave.Audio.Backend.behaviour_info(:callbacks)
+      assert {:subscribe, 1} in callbacks
+      assert {:unsubscribe, 1} in callbacks
       assert {:play_tx, 4} in callbacks
-      assert {:start_rx, 2} in callbacks
-      assert {:stop_rx, 1} in callbacks
       assert {:tx_active?, 1} in callbacks
       assert {:capabilities, 0} in callbacks
     end

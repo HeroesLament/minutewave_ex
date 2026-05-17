@@ -9,23 +9,40 @@ defmodule Minutewave.Audio.Backend do
   USB Audio Class device.
 
   Operator-facing audio (speaker, microphone, BT headset) is a *separate*
-  concern handled by `Minutewave.OperatorVoice.Backend`. The radio-side
-  backend is for modem audio only — including MELPe-encoded voice that
-  travels as data inside 110D frames.
+  concern that minutewave does not model. The radio-side backend is for
+  modem audio only — including MELPe-encoded voice that travels as data
+  inside 110D frames.
 
   ## Sample format
 
-  Backends must accept and produce `i16` little-endian PCM samples. The
-  sample rate is configured per backend at start-up; protocol code passes
-  the rate it expects and the backend is responsible for resampling if
-  the underlying device runs at a different rate.
+  Backends produce `i16` PCM samples. The sample rate is backend-defined;
+  protocol code receives whatever the backend sends and is responsible for
+  matching its DSP configuration to the backend's native rate.
+
+  ## RX delivery model
+
+  RX is pub/sub. The protocol code (typically RxFSM) calls `subscribe/1`
+  during initialization. The backend sends RX audio to subscribers as
+  Erlang messages of one of two shapes:
+
+      {:rx_audio, rig_id, samples}
+      {:rx_audio, rig_id, samples, metadata}
+
+  The second form carries backend-specific metadata (e.g. simnet channel
+  state, SNR estimates). Subscribers should pattern-match both.
+
+  ## TX delivery model
+
+  TX is push. The protocol code calls `play_tx/4` with a buffer of samples;
+  the backend queues them for transmission. `tx_active?/1` lets the Arbiter
+  check whether a TX is currently in flight before granting a new one.
 
   ## Per-rig multiplicity
 
   A single Elixir node may control multiple rigs simultaneously. Each
-  rig is identified by an opaque `rig_id` (typically an atom or a UUID).
-  Backends multiplex on `rig_id`; the protocol code does not know how
-  many physical audio paths exist or how they are routed.
+  rig is identified by an opaque `rig_id`. Backends multiplex on `rig_id`;
+  protocol code does not know how many physical audio paths exist or how
+  they are routed.
   """
 
   @typedoc """
@@ -50,32 +67,29 @@ defmodule Minutewave.Audio.Backend do
   @type samples :: [integer()] | binary()
 
   @doc """
+  Subscribe the calling process to RX audio for the given rig.
+
+  After subscribing, the caller receives messages of shape
+  `{:rx_audio, rig_id, samples}` or `{:rx_audio, rig_id, samples, metadata}`.
+  """
+  @callback subscribe(rig_id) :: :ok | {:error, term()}
+
+  @doc """
+  Unsubscribe the calling process from RX audio for the given rig.
+  """
+  @callback unsubscribe(rig_id) :: :ok
+
+  @doc """
   Play a buffer of TX samples to the radio for the given rig.
 
   Returns `:ok` once the samples have been queued (not necessarily once
-  they have completed playing — see `notify_tx_complete/1` for the
-  completion signal).
+  they have completed playing).
 
   May return `{:error, reason}` if the backend is not ready, the device
   is disconnected, or the rig_id is not registered.
   """
   @callback play_tx(rig_id, samples, sample_rate, opts) ::
               :ok | {:error, term()}
-
-  @doc """
-  Start capturing RX samples from the radio for the given rig.
-
-  Once started, the backend should send `{:rx_audio, rig_id, samples}`
-  messages to the configured receiver process (typically the rig's
-  RxFSM). Sample chunk size is backend-dependent but should be small
-  enough to avoid stalling the demodulator.
-  """
-  @callback start_rx(rig_id, sample_rate) :: :ok | {:error, term()}
-
-  @doc """
-  Stop capturing RX samples for the given rig.
-  """
-  @callback stop_rx(rig_id) :: :ok
 
   @doc """
   Query whether TX is currently active for the given rig.

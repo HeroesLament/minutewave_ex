@@ -141,7 +141,7 @@ defmodule Minutewave.Modem.TxFSM do
     rig_id = Keyword.fetch!(opts, :rig_id)
 
     # Set rig identifier for all log messages from this process
-    Logger.metadata(rig: String.slice(rig_id, 0, 8))
+    Logger.metadata(rig: String.slice(to_string(rig_id), 0, 8))
 
     # Waveform configuration
     waveform = Keyword.get(opts, :waveform, 1)

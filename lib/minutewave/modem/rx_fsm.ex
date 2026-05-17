@@ -139,7 +139,7 @@ defmodule Minutewave.Modem.RxFSM do
     sample_rate = Keyword.get(opts, :sample_rate, 9600)
 
     # Set rig identifier for all log messages from this process
-    Logger.metadata(rig: String.slice(rig_id, 0, 8))
+    Logger.metadata(rig: String.slice(to_string(rig_id), 0, 8))
 
     # Create PHY receiver
     phy_rx = PhyRx.new(bw_khz, sample_rate: sample_rate)

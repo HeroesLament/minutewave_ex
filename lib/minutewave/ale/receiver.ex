@@ -1080,7 +1080,7 @@ defmodule Minutewave.ALE.Receiver do
   ## Helpers
   ## ------------------------------------------------------------------
 
-  defp short(rig_id) when is_binary(rig_id), do: String.slice(rig_id, 0, 8)
+  defp short(rig_id) when is_binary(rig_id), do: String.slice(to_string(rig_id), 0, 8)
   defp short(rig_id), do: inspect(rig_id)
 
   defp pdu_type_name(%{__struct__: struct}) do

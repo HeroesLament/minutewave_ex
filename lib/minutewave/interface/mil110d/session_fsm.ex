@@ -77,7 +77,7 @@ defmodule Minutewave.Interface.MIL110D.SessionFSM do
     socket = Keyword.fetch!(opts, :socket)
 
     # Set rig identifier for all log messages from this process
-    Logger.metadata(rig: String.slice(rig_id, 0, 8))
+    Logger.metadata(rig: String.slice(to_string(rig_id), 0, 8))
 
     data = %__MODULE__{
       rig_id: rig_id,

@@ -74,3 +74,77 @@ defmodule Minutewave.Dsp.PhyModemTest do
     end
   end
 end
+
+defmodule Minutewave.Modem.EventsTest do
+  use ExUnit.Case
+
+  alias Minutewave.Modem.Events
+
+  test "subscribe + broadcast + unsubscribe round trip" do
+    rig_id = :"test_rig_#{System.unique_integer([:positive])}"
+
+    {:ok, _pid} = Events.start_link(rig_id: rig_id)
+
+    :ok = Events.subscribe(rig_id, self())
+
+    Events.broadcast(rig_id, {:modem, {:rx_data, "hello", :first}})
+    assert_receive {:modem, {:rx_data, "hello", :first}}, 500
+
+    :ok = Events.unsubscribe(rig_id, self())
+
+    Events.broadcast(rig_id, {:modem, {:rx_data, "after_unsubscribe", :first}})
+    refute_receive {:modem, _}, 100
+  end
+
+  test "subscribe with :tx filter only receives tx events" do
+    rig_id = :"test_rig_#{System.unique_integer([:positive])}"
+    {:ok, _pid} = Events.start_link(rig_id: rig_id)
+
+    :ok = Events.subscribe(rig_id, self(), filter: :tx)
+
+    Events.broadcast(rig_id, {:modem, {:tx_status, %{state: :idle}}})
+    Events.broadcast(rig_id, {:modem, {:rx_data, "no", :first}})
+
+    assert_receive {:modem, {:tx_status, _}}, 500
+    refute_receive {:modem, {:rx_data, _, _}}, 100
+  end
+end
+
+defmodule Minutewave.Dsp.DemodOutputTest do
+  use ExUnit.Case
+
+  alias Minutewave.Dsp.DemodOutput
+
+  test "Symbols struct" do
+    s = %DemodOutput.Symbols{data: [0, 1, 2, 3], timing_offset: 5}
+    assert s.data == [0, 1, 2, 3]
+    assert s.timing_offset == 5
+  end
+
+  test "IQ struct + slice/2 QPSK" do
+    iq = %DemodOutput.IQ{
+      data: [{1.0, 0.0}, {0.0, 1.0}, {-1.0, 0.0}, {0.0, -1.0}],
+      timing_offset: 0
+    }
+
+    result = DemodOutput.slice(iq, :qpsk)
+    assert %DemodOutput.Symbols{} = result
+    # One symbol per quadrant
+    assert length(result.data) == 4
+    assert Enum.uniq(result.data) |> length() == 4
+  end
+
+  test "slice/2 BPSK" do
+    iq = %DemodOutput.IQ{
+      data: [{1.0, 0.0}, {-1.0, 0.0}, {0.5, 0.1}, {-0.5, -0.1}],
+      timing_offset: 0
+    }
+
+    assert %DemodOutput.Symbols{data: [0, 1, 0, 1]} = DemodOutput.slice(iq, :bpsk)
+  end
+
+  test "slice/2 is identity on Symbols" do
+    s = %DemodOutput.Symbols{data: [0, 1, 2, 3]}
+    assert ^s = DemodOutput.slice(s, :qpsk)
+  end
+end

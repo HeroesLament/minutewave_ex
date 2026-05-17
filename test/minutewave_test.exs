@@ -121,17 +121,20 @@ defmodule Minutewave.Dsp.DemodOutputTest do
     assert s.timing_offset == 5
   end
 
-  test "IQ struct + slice/2 QPSK" do
+  test "IQ struct + slice/2 QPSK — one symbol per quadrant" do
+    # Points placed strictly inside each quadrant (not on the I or Q axis,
+    # since the axis-sign comparison treats 0.0 as positive).
     iq = %DemodOutput.IQ{
-      data: [{1.0, 0.0}, {0.0, 1.0}, {-1.0, 0.0}, {0.0, -1.0}],
+      data: [
+        {1.0, 0.5},    # Q1 (+I, +Q) → 0
+        {-0.5, 1.0},   # Q2 (-I, +Q) → 1
+        {-1.0, -0.5},  # Q3 (-I, -Q) → 3 (Gray)
+        {0.5, -1.0}    # Q4 (+I, -Q) → 2 (Gray)
+      ],
       timing_offset: 0
     }
 
-    result = DemodOutput.slice(iq, :qpsk)
-    assert %DemodOutput.Symbols{} = result
-    # One symbol per quadrant
-    assert length(result.data) == 4
-    assert Enum.uniq(result.data) |> length() == 4
+    assert %DemodOutput.Symbols{data: [0, 1, 3, 2]} = DemodOutput.slice(iq, :qpsk)
   end
 
   test "slice/2 BPSK" do

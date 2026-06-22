@@ -85,7 +85,7 @@ defmodule Minutewave.ALE.LQA do
   Score a decoded-frame observation and broadcast it for the consumer to persist.
 
   Emits `{:ale, {:lqa_observation, map}}` on the rig's event bus. The map
-  carries the computed `:score` plus the raw inputs so a subscriber can both
+  carries the computed `:lqa_score` plus the raw inputs so a subscriber can both
   store the score and recompute if scoring weights change later.
 
   ## Parameters
@@ -102,7 +102,7 @@ defmodule Minutewave.ALE.LQA do
       rig_id: rig_id,
       source_addr: source_addr,
       freq_hz: freq_hz,
-      score: lqa_score,
+      lqa_score: lqa_score,
       direction: :rx,
       frame_type: Keyword.get(opts, :frame_type, "call"),
       net_id: Keyword.get(opts, :net_id),
@@ -164,7 +164,7 @@ defmodule Minutewave.ALE.LQA do
             Enum.reduce(obs, {0.0, 0.0}, fn o, {ws, wt} ->
               age_hours = DateTime.diff(now, o.timestamp, :second) / 3600.0
               weight = :math.exp(-0.693 * age_hours / decay_hours)
-              {ws + (o.score || 0.0) * weight, wt + weight}
+              {ws + (o.lqa_score || 0.0) * weight, wt + weight}
             end)
 
           avg = if weight_total > 0, do: weighted_sum / weight_total, else: 0.0

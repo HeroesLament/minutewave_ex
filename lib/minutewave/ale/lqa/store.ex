@@ -16,7 +16,7 @@ defmodule Minutewave.ALE.LQA.Store do
   @type observation :: %{
           freq_hz: integer(),
           timestamp: DateTime.t(),
-          score: float() | nil
+          lqa_score: float() | nil
         }
 
   @doc """

@@ -45,16 +45,28 @@ defmodule Minutewave.ALE.Link do
   alias Minutewave.Rig.SimnetBridge
 
   # Default timing parameters (milliseconds)
+  # All-ones broadcast address (G.5.7.4 undirected TOD request Called Address).
+  @broadcast_addr 0xFFFF
+
   @default_timing %{
-    t_lbt: 200,           # Listen before transmit duration
-    t_lbr: 200,           # Listen before respond duration
-    t_tune: 40,           # Radio tuning time
-    t_handshake: 100,     # PDU processing + radio turnaround
-    t_response: 5000,     # Wait for response (must cover remote RX + processing + remote TX + our decode)
-    t_traffic: 3000,      # Wait for traffic after link setup
-    t_activity: 30_000,   # Link inactivity timeout
-    scan_dwell_ms: 500,   # Time to listen on each channel while scanning
-    t_tx_offset: 40       # TTxOffset_TLC: delay after dwell start before transmitting (radio tuning settling)
+    # Listen before transmit duration
+    t_lbt: 200,
+    # Listen before respond duration
+    t_lbr: 200,
+    # Radio tuning time
+    t_tune: 40,
+    # PDU processing + radio turnaround
+    t_handshake: 100,
+    # Wait for response (must cover remote RX + processing + remote TX + our decode)
+    t_response: 5000,
+    # Wait for traffic after link setup
+    t_traffic: 3000,
+    # Link inactivity timeout
+    t_activity: 30_000,
+    # Time to listen on each channel while scanning
+    scan_dwell_ms: 500,
+    # TTxOffset_TLC: delay after dwell start before transmitting (radio tuning settling)
+    t_tx_offset: 40
   }
 
   # Default channel set for scanning when no net is configured.
@@ -210,31 +222,53 @@ defmodule Minutewave.ALE.Link do
 
   @impl true
   def init(data) do
-    Logger.info("ALE Link starting for rig #{data.rig_id}, self_addr=0x#{Integer.to_string(data.self_addr, 16)}")
+    Logger.info(
+      "ALE Link starting for rig #{data.rig_id}, self_addr=0x#{Integer.to_string(data.self_addr, 16)}"
+    )
 
-    initial_data = Map.merge(data, %{
-      remote_addr: nil,
-      call_opts: %{},
-      link_info: nil,
-      waveform: :fast,
-      # Scanning state
-      channels: @default_channels,
-      scan_index: 0,
-      scan_mode: :ale_4g,
-      scan_epoch_ms: nil,       # Monotonic time when scan index 0 started
-      current_freq_hz: nil,
-      # Calling state — synchronous call scheduling
-      call_freq_hz: nil,
-      pending_call: nil,        # %{dest_addr, opts, call_freq_hz, lbt_at_ms} when waiting for call slot
-      # Sounding state
-      sounding_schedule: %{},   # %{freq_hz => DateTime.t()} — last sounding time per freq
-      sounding_queue: [],       # [{freq_hz, symbols}, ...] — channels remaining in manual sounding run
-      sounding_return_state: nil, # :idle | :scanning — state to return to after sounding completes
-      soundings_this_cycle: 0,  # Counter for per-cycle sounding cap during scan
-      sounding_enabled: false,  # Whether automatic scan sounding is active (from net config)
-      sounding_interval_s: 300, # Minimum seconds between soundings per channel
-      sounding_waveform: :deep  # Waveform used for sounding TX (from net config)
-    })
+    initial_data =
+      Map.merge(data, %{
+        remote_addr: nil,
+        call_opts: %{},
+        link_info: nil,
+        waveform: :fast,
+        # Scanning state
+        channels: @default_channels,
+        scan_index: 0,
+        scan_mode: :ale_4g,
+        # Monotonic time when scan index 0 started
+        scan_epoch_ms: nil,
+        # Per-dwell sampled: clock quality permits sync scan (:locked|:holdover). Gated in sync_scan?/1
+        clock_sync_ok: true,
+        # Transient state while serving a TOD request (G.5.7.4)
+        tod_info: nil,
+        # If set to self_addr, this PU answers undirected TOD requests (NCS)
+        net_control_addr: nil,
+        # Monotonic time our outbound TOD request PDU ended (requester side, G.5.7.4.3)
+        tod_req_end_mono: nil,
+        # If true, auto-request TOD when clock degrades to :unsynced (G.5.7.4)
+        tod_request_enabled: false,
+        current_freq_hz: nil,
+        # Calling state — synchronous call scheduling
+        call_freq_hz: nil,
+        # %{dest_addr, opts, call_freq_hz, lbt_at_ms} when waiting for call slot
+        pending_call: nil,
+        # Sounding state
+        # %{freq_hz => DateTime.t()} — last sounding time per freq
+        sounding_schedule: %{},
+        # [{freq_hz, symbols}, ...] — channels remaining in manual sounding run
+        sounding_queue: [],
+        # :idle | :scanning — state to return to after sounding completes
+        sounding_return_state: nil,
+        # Counter for per-cycle sounding cap during scan
+        soundings_this_cycle: 0,
+        # Whether automatic scan sounding is active (from net config)
+        sounding_enabled: false,
+        # Minimum seconds between soundings per channel
+        sounding_interval_s: 300,
+        # Waveform used for sounding TX (from net config)
+        sounding_waveform: :deep
+      })
 
     {:ok, :idle, initial_data}
   end
@@ -255,23 +289,26 @@ defmodule Minutewave.ALE.Link do
     if scan_config.channels == [] do
       {:keep_state_and_data, [{:reply, from, {:error, :no_channels}}]}
     else
-      Logger.info("ALE Link [#{data.rig_id}] starting SCAN: #{length(scan_config.channels)} channels, " <>
-        "dwell=#{scan_config.scan_dwell_ms}ms, sounding_wf=#{scan_config.sounding_waveform}, mode=#{scan_config.scan_mode}, " <>
-        "sounding=#{scan_config.sounding_enabled}")
+      Logger.info(
+        "ALE Link [#{data.rig_id}] starting SCAN: #{length(scan_config.channels)} channels, " <>
+          "dwell=#{scan_config.scan_dwell_ms}ms, sounding_wf=#{scan_config.sounding_waveform}, mode=#{scan_config.scan_mode}, " <>
+          "sounding=#{scan_config.sounding_enabled}"
+      )
 
       timing = %{data.timing | scan_dwell_ms: scan_config.scan_dwell_ms}
 
-      new_data = %{data |
-        waveform: scan_config.sounding_waveform,
-        channels: scan_config.channels,
-        scan_index: 0,
-        timing: timing,
-        scan_mode: scan_config.scan_mode,
-        sounding_schedule: Sounder.seed_schedule(Map.get(data, :initial_schedule, %{})),
-        sounding_enabled: scan_config.sounding_enabled,
-        sounding_interval_s: scan_config.sounding_interval_s,
-        sounding_waveform: scan_config.sounding_waveform,
-        soundings_this_cycle: 0
+      new_data = %{
+        data
+        | waveform: scan_config.sounding_waveform,
+          channels: scan_config.channels,
+          scan_index: 0,
+          timing: timing,
+          scan_mode: scan_config.scan_mode,
+          sounding_schedule: Sounder.seed_schedule(Map.get(data, :initial_schedule, %{})),
+          sounding_enabled: scan_config.sounding_enabled,
+          sounding_interval_s: scan_config.sounding_interval_s,
+          sounding_waveform: scan_config.sounding_waveform,
+          soundings_this_cycle: 0
       }
 
       {:next_state, :scanning, new_data, [{:reply, from, :ok}]}
@@ -286,9 +323,10 @@ defmodule Minutewave.ALE.Link do
     # 1. Explicit :freq_hz in opts — operator override
     # 2. LQA best channel for this destination — data-driven
     # 3. Current scan channel — fallback
-    call_freq = Keyword.get(opts, :freq_hz)
-      || lqa_best_freq(data.rig_id, dest_addr, scan_config.channels)
-      || freq_at_index(scan_config.channels, data.scan_index)
+    call_freq =
+      Keyword.get(opts, :freq_hz) ||
+        lqa_best_freq(data.rig_id, dest_addr, scan_config.channels) ||
+        freq_at_index(scan_config.channels, data.scan_index)
 
     # Per G.5.5.4: Synchronous two-way PTP link setup requires the caller
     # to be scanning synchronously with the called station. The caller
@@ -305,7 +343,9 @@ defmodule Minutewave.ALE.Link do
 
     if call_ch_index != nil and length(scan_config.channels) > 1 do
       # Synchronous mode: enter scanning with pending call
-      Logger.info("ALE Link [#{data.rig_id}] sync call to 0x#{Integer.to_string(dest_addr, 16)} on #{format_freq(call_freq)} — entering scan to schedule")
+      Logger.info(
+        "ALE Link [#{data.rig_id}] sync call to 0x#{Integer.to_string(dest_addr, 16)} on #{format_freq(call_freq)} — entering scan to schedule"
+      )
 
       timing = %{data.timing | scan_dwell_ms: scan_config.scan_dwell_ms}
 
@@ -315,38 +355,46 @@ defmodule Minutewave.ALE.Link do
         call_freq_hz: call_freq,
         call_ch_index: call_ch_index,
         waveform: waveform,
-        lbt_at_ms: nil  # Will be computed once scanning establishes an epoch
+        # Will be computed once scanning establishes an epoch
+        lbt_at_ms: nil
       }
 
-      new_data = %{data |
-        remote_addr: dest_addr,
-        call_opts: Map.new(opts),
-        call_freq_hz: call_freq,
-        waveform: waveform,
-        channels: scan_config.channels,
-        scan_index: 0,
-        scan_mode: scan_config.scan_mode,
-        timing: timing,
-        pending_call: pending
+      new_data = %{
+        data
+        | remote_addr: dest_addr,
+          call_opts: Map.new(opts),
+          call_freq_hz: call_freq,
+          waveform: waveform,
+          channels: scan_config.channels,
+          scan_index: 0,
+          scan_mode: scan_config.scan_mode,
+          timing: timing,
+          pending_call: pending
       }
 
       {:next_state, :scanning, new_data, [{:reply, from, :ok}]}
     else
       # Ad-hoc / single-channel mode: immediate call
-      Logger.info("ALE Link [#{data.rig_id}] ad-hoc call to 0x#{Integer.to_string(dest_addr, 16)} on #{format_freq(call_freq)} with #{waveform}")
+      Logger.info(
+        "ALE Link [#{data.rig_id}] ad-hoc call to 0x#{Integer.to_string(dest_addr, 16)} on #{format_freq(call_freq)} with #{waveform}"
+      )
 
-      new_data = %{data |
-        remote_addr: dest_addr,
-        call_opts: Map.new(opts),
-        call_freq_hz: call_freq,
-        waveform: waveform,
-        channels: scan_config.channels
+      new_data = %{
+        data
+        | remote_addr: dest_addr,
+          call_opts: Map.new(opts),
+          call_freq_hz: call_freq,
+          waveform: waveform,
+          channels: scan_config.channels
       }
 
       tune_rig(data.rig_id, call_freq)
 
       {:next_state, :lbt, new_data,
-       [{:reply, from, :ok}, {:state_timeout, data.timing.t_tune + data.timing.t_lbt, :lbt_complete}]}
+       [
+         {:reply, from, :ok},
+         {:state_timeout, data.timing.t_tune + data.timing.t_lbt, :lbt_complete}
+       ]}
     end
   end
 
@@ -361,19 +409,21 @@ defmodule Minutewave.ALE.Link do
     if channels == [] do
       {:keep_state_and_data, [{:reply, from, {:error, :no_channels}}]}
     else
-      queue = Enum.map(channels, fn ch ->
-        freq = channel_freq(ch)
-        symbols = Sounder.build_sounding_frame(data.self_addr, waveform: waveform, include_probe: true)
-        %{freq_hz: freq, symbols: symbols}
-      end)
+      queue =
+        Enum.map(channels, fn ch ->
+          freq = channel_freq(ch)
 
-      Logger.info("ALE Link [#{data.rig_id}] manual sounding: #{length(queue)} channels, waveform=#{waveform}")
+          symbols =
+            Sounder.build_sounding_frame(data.self_addr, waveform: waveform, include_probe: true)
 
-      new_data = %{data |
-        sounding_queue: queue,
-        sounding_return_state: :idle,
-        waveform: waveform
-      }
+          %{freq_hz: freq, symbols: symbols}
+        end)
+
+      Logger.info(
+        "ALE Link [#{data.rig_id}] manual sounding: #{length(queue)} channels, waveform=#{waveform}"
+      )
+
+      new_data = %{data | sounding_queue: queue, sounding_return_state: :idle, waveform: waveform}
 
       {:next_state, :sounding, new_data, [{:reply, from, :ok}]}
     end
@@ -382,26 +432,31 @@ defmodule Minutewave.ALE.Link do
   def idle(:cast, {:rx_pdu, %PDU.LsuReq{} = pdu}, data) do
     # Received a call while idle - are we the called station?
     if pdu.called_addr == data.self_addr do
-      Logger.info("ALE Link [#{data.rig_id}] received call from 0x#{Integer.to_string(pdu.caller_addr, 16)}")
+      Logger.info(
+        "ALE Link [#{data.rig_id}] received call from 0x#{Integer.to_string(pdu.caller_addr, 16)}"
+      )
 
-      new_data = %{data |
-        remote_addr: pdu.caller_addr,
-        link_info: %{
-          caller_addr: pdu.caller_addr,
-          called_addr: pdu.called_addr,
-          voice: pdu.voice,
-          traffic_type: pdu.traffic_type,
-          assigned_subchannels: pdu.assigned_subchannels,
-          occupied_subchannels: pdu.occupied_subchannels,
-          rx_snr: nil
-        }
+      new_data = %{
+        data
+        | remote_addr: pdu.caller_addr,
+          link_info: %{
+            caller_addr: pdu.caller_addr,
+            called_addr: pdu.called_addr,
+            voice: pdu.voice,
+            traffic_type: pdu.traffic_type,
+            assigned_subchannels: pdu.assigned_subchannels,
+            occupied_subchannels: pdu.occupied_subchannels,
+            rx_snr: nil
+          }
       }
 
       # Stay on current frequency for LBR (we heard the call here)
-      {:next_state, :lbr, new_data,
-       [{:state_timeout, data.timing.t_lbr, :lbr_complete}]}
+      {:next_state, :lbr, new_data, [{:state_timeout, data.timing.t_lbr, :lbr_complete}]}
     else
-      Logger.debug("ALE Link [#{data.rig_id}] ignoring call for 0x#{Integer.to_string(pdu.called_addr, 16)}")
+      Logger.debug(
+        "ALE Link [#{data.rig_id}] ignoring call for 0x#{Integer.to_string(pdu.called_addr, 16)}"
+      )
+
       :keep_state_and_data
     end
   end
@@ -428,12 +483,24 @@ defmodule Minutewave.ALE.Link do
     n_channels = length(data.channels)
     cycle_len = n_channels * dwell_ms
 
-    # Synchronous scanning: align to wall clock so all stations on the
-    # same net are in lockstep. The epoch is the most recent cycle
-    # boundary in wall-clock time. Since all stations use the same
-    # clock reference and the same cycle_len, they compute the same
-    # channel index at any given moment.
-    now_wall = System.os_time(:millisecond)
+    # Synchronous scanning: align to disciplined protocol time so all
+    # stations on the same net are in lockstep. Protocol time is
+    # GNSS-disciplined (or peer-TOD, if opted in); see Minutewave.Clock.
+    # When the clock is :unsynced the epoch falls back to OS wall time and
+    # lockstep cannot be guaranteed across stations.
+    # Sample the clock authority once per scan-entry. clock_sync_ok gates
+    # sync_scan?/1: when the clock is :unsynced, every sync consumer (sounding,
+    # call scheduling, dwell stepping) degrades to the async / shared-pool path.
+    clock_sync_ok = clock_permits_sync?()
+
+    unless clock_sync_ok do
+      Logger.warning(
+        "ALE Link [#{data.rig_id}] clock UNSYNCED on scan entry; " <>
+          "degrading to async (no GNSS/TOD discipline within guard)"
+      )
+    end
+
+    now_wall = Minutewave.Clock.protocol_time_ms()
     epoch = now_wall - rem(now_wall, cycle_len)
 
     # Compute which channel index we should be on right now
@@ -447,7 +514,10 @@ defmodule Minutewave.ALE.Link do
     freq = channel_freq(channel)
     tune_rig(data.rig_id, freq)
 
-    Logger.info("ALE Link [#{data.rig_id}] scan: synced to #{channel_name(channel)} (#{format_freq(freq)}), index=#{current_index}/#{n_channels}, #{remaining_dwell}ms left in dwell")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] scan: synced to #{channel_name(channel)} (#{format_freq(freq)}), index=#{current_index}/#{n_channels}, #{remaining_dwell}ms left in dwell"
+    )
+
     broadcast_state_change(data.rig_id, :scanning, %{
       waveform: data.waveform,
       scan_mode: data.scan_mode,
@@ -462,21 +532,30 @@ defmodule Minutewave.ALE.Link do
     # If there's a pending call without a computed lbt_at_ms (came from idle),
     # compute it now that we have an epoch.
     now_mono = System.monotonic_time(:millisecond)
-    updated_pending = case data.pending_call do
-      %{lbt_at_ms: nil, call_ch_index: call_ch_index} = pending ->
-        lbt_at = compute_lbt_time(epoch, call_ch_index, data.timing, n_channels, now_wall, now_mono)
-        Logger.info("ALE Link [#{data.rig_id}] sync call scheduled: LBT in #{lbt_at - now_mono}ms for ch #{call_ch_index}")
-        %{pending | lbt_at_ms: lbt_at}
 
-      other ->
-        other
-    end
+    updated_pending =
+      case data.pending_call do
+        %{lbt_at_ms: nil, call_ch_index: call_ch_index} = pending ->
+          lbt_at =
+            compute_lbt_time(epoch, call_ch_index, data.timing, n_channels, now_wall, now_mono)
 
-    new_data = %{data |
-      current_freq_hz: freq,
-      scan_epoch_ms: epoch,
-      scan_index: current_index,
-      pending_call: updated_pending
+          Logger.info(
+            "ALE Link [#{data.rig_id}] sync call scheduled: LBT in #{lbt_at - now_mono}ms for ch #{call_ch_index}"
+          )
+
+          %{pending | lbt_at_ms: lbt_at}
+
+        other ->
+          other
+      end
+
+    new_data = %{
+      data
+      | current_freq_hz: freq,
+        scan_epoch_ms: epoch,
+        scan_index: current_index,
+        clock_sync_ok: clock_sync_ok,
+        pending_call: updated_pending
     }
 
     # Start the dwell timer for the remaining time in the current dwell slot
@@ -491,14 +570,17 @@ defmodule Minutewave.ALE.Link do
     case data.pending_call do
       %{lbt_at_ms: lbt_at} = pending when is_integer(lbt_at) and now_mono >= lbt_at ->
         # Time to jump to the call frequency and begin LBT
-        Logger.info("ALE Link [#{data.rig_id}] sync call: jumping to #{format_freq(pending.call_freq_hz)} for LBT")
+        Logger.info(
+          "ALE Link [#{data.rig_id}] sync call: jumping to #{format_freq(pending.call_freq_hz)} for LBT"
+        )
 
-        new_data = %{data |
-          remote_addr: pending.dest_addr,
-          call_opts: pending.call_opts,
-          call_freq_hz: pending.call_freq_hz,
-          waveform: pending.waveform,
-          pending_call: nil
+        new_data = %{
+          data
+          | remote_addr: pending.dest_addr,
+            call_opts: pending.call_opts,
+            call_freq_hz: pending.call_freq_hz,
+            waveform: pending.waveform,
+            pending_call: nil
         }
 
         tune_rig(data.rig_id, pending.call_freq_hz)
@@ -513,7 +595,7 @@ defmodule Minutewave.ALE.Link do
         n_channels = length(data.channels)
         cycle_len = n_channels * dwell_ms
 
-        now_wall = System.os_time(:millisecond)
+        now_wall = Minutewave.Clock.protocol_time_ms()
         ms_into_cycle = rem(now_wall - data.scan_epoch_ms, cycle_len)
         next_index = min(div(ms_into_cycle, dwell_ms), n_channels - 1)
         ms_into_dwell = ms_into_cycle - next_index * dwell_ms
@@ -522,9 +604,12 @@ defmodule Minutewave.ALE.Link do
         channel = Enum.at(data.channels, next_index)
         freq = channel_freq(channel)
 
-        Logger.info("ALE Link [#{data.rig_id}] scan: hop to #{channel_name(channel)} (#{format_freq(freq)}), index=#{next_index}/#{n_channels}")
+        Logger.info(
+          "ALE Link [#{data.rig_id}] scan: hop to #{channel_name(channel)} (#{format_freq(freq)}), index=#{next_index}/#{n_channels}"
+        )
 
         tune_rig(data.rig_id, freq)
+
         broadcast_state_change(data.rig_id, :scanning, %{
           waveform: data.waveform,
           scan_mode: data.scan_mode,
@@ -539,10 +624,31 @@ defmodule Minutewave.ALE.Link do
         # Reset soundings_this_cycle when we wrap around to index 0
         soundings_count = if next_index == 0, do: 0, else: data.soundings_this_cycle
 
-        updated_data = %{data |
-          scan_index: next_index,
-          current_freq_hz: freq,
-          soundings_this_cycle: soundings_count
+        # Re-sample the clock authority once per dwell hop. A transition here
+        # flips sync_scan?/1 for the next dwell: GNSS/TOD loss past guard drops
+        # us to async; recovery (re-lock or holdover-in-spec) restores sync.
+        clock_sync_ok = clock_permits_sync?()
+
+        if clock_sync_ok != data.clock_sync_ok do
+          Logger.info(
+            "ALE Link [#{data.rig_id}] clock sync #{if clock_sync_ok, do: "RESTORED", else: "LOST"}; " <>
+              "scan mode -> #{if clock_sync_ok, do: "sync", else: "async"}"
+          )
+        end
+
+        # 6c trigger (G.5.7.4): on the sync -> unsynced edge, if configured to
+        # seek time, initiate an undirected TOD request. Cast to self so the
+        # transition happens from a clean handler rather than re-entrantly here.
+        if data.clock_sync_ok and not clock_sync_ok and data.tod_request_enabled do
+          GenStateMachine.cast(self(), :request_tod)
+        end
+
+        updated_data = %{
+          data
+          | scan_index: next_index,
+            current_freq_hz: freq,
+            soundings_this_cycle: soundings_count,
+            clock_sync_ok: clock_sync_ok
         }
 
         # Schedule a sounding early in this dwell if needed.
@@ -556,6 +662,7 @@ defmodule Minutewave.ALE.Link do
 
   def scanning({:call, from}, :get_state, data) do
     channel = Enum.at(data.channels, data.scan_index)
+
     info = %{
       waveform: data.waveform,
       scan_mode: data.scan_mode,
@@ -566,6 +673,7 @@ defmodule Minutewave.ALE.Link do
       num_channels: length(data.channels),
       pending_call: data.pending_call != nil
     }
+
     {:keep_state_and_data, [{:reply, from, {:scanning, info}}]}
   end
 
@@ -578,44 +686,66 @@ defmodule Minutewave.ALE.Link do
     #
     # Channel selection: explicit freq > LQA best > current scan channel.
     waveform = Keyword.get(opts, :waveform, :deep)
-    call_freq = Keyword.get(opts, :freq_hz)
-      || lqa_best_freq(data.rig_id, dest_addr, data.channels)
-      || data.current_freq_hz
+
+    call_freq =
+      Keyword.get(opts, :freq_hz) ||
+        lqa_best_freq(data.rig_id, dest_addr, data.channels) ||
+        data.current_freq_hz
 
     # Find the channel index for the call frequency
     call_ch_index = find_channel_index(data.channels, call_freq)
 
     if call_ch_index == nil do
-      Logger.warning("ALE Link [#{data.rig_id}] call freq #{format_freq(call_freq)} not in channel set")
+      Logger.warning(
+        "ALE Link [#{data.rig_id}] call freq #{format_freq(call_freq)} not in channel set"
+      )
+
       {:keep_state_and_data, [{:reply, from, {:error, :freq_not_in_channel_set}}]}
     else
-      now_wall = System.os_time(:millisecond)
+      now_wall = Minutewave.Clock.protocol_time_ms()
       now_mono = System.monotonic_time(:millisecond)
-      lbt_at = compute_lbt_time(data.scan_epoch_ms, call_ch_index, data.timing, length(data.channels), now_wall, now_mono)
+
+      lbt_at =
+        compute_lbt_time(
+          data.scan_epoch_ms,
+          call_ch_index,
+          data.timing,
+          length(data.channels),
+          now_wall,
+          now_mono
+        )
+
       time_until_lbt = lbt_at - now_mono
 
       if time_until_lbt <= 0 do
         # We're already in or past the LBT window — go immediately.
-        Logger.info("ALE Link [#{data.rig_id}] sync call: immediate LBT on #{format_freq(call_freq)}")
+        Logger.info(
+          "ALE Link [#{data.rig_id}] sync call: immediate LBT on #{format_freq(call_freq)}"
+        )
 
-        new_data = %{data |
-          remote_addr: dest_addr,
-          call_opts: Map.new(opts),
-          call_freq_hz: call_freq,
-          waveform: waveform,
-          pending_call: nil
+        new_data = %{
+          data
+          | remote_addr: dest_addr,
+            call_opts: Map.new(opts),
+            call_freq_hz: call_freq,
+            waveform: waveform,
+            pending_call: nil
         }
 
         tune_rig(data.rig_id, call_freq)
 
         {:next_state, :lbt, new_data,
-         [{:reply, from, :ok},
-          {:state_timeout, data.timing.t_tune + data.timing.t_lbt, :lbt_complete}]}
+         [
+           {:reply, from, :ok},
+           {:state_timeout, data.timing.t_tune + data.timing.t_lbt, :lbt_complete}
+         ]}
       else
         # Schedule the call — continue scanning until it's time to jump.
-        Logger.info("ALE Link [#{data.rig_id}] sync call: scheduling call to " <>
-          "0x#{Integer.to_string(dest_addr, 16)} on #{format_freq(call_freq)} (ch #{call_ch_index}), " <>
-          "LBT in #{time_until_lbt}ms")
+        Logger.info(
+          "ALE Link [#{data.rig_id}] sync call: scheduling call to " <>
+            "0x#{Integer.to_string(dest_addr, 16)} on #{format_freq(call_freq)} (ch #{call_ch_index}), " <>
+            "LBT in #{time_until_lbt}ms"
+        )
 
         pending = %{
           dest_addr: dest_addr,
@@ -644,29 +774,72 @@ defmodule Minutewave.ALE.Link do
     {:next_state, :idle, %{data | pending_call: nil}}
   end
 
+  def scanning(:cast, {:rx_pdu, %PDU.LsuReq{traffic_type: 63} = pdu}, data) do
+    # A TOD Request (Traffic Type = TOD, G.5.7.4): directed (called_addr == us)
+    # or undirected (called_addr == broadcast, implicitly the Net Control PU).
+    # Respond only if eligible and our own clock is trustworthy (not :unsynced).
+    # The response is sent exactly T_Confirm after the request PDU ends, via the
+    # tod_responding state (mirrors the LSU_Conf timing in `responding`).
+    directed? = pdu.called_addr == data.self_addr
+    undirected? = pdu.called_addr == @broadcast_addr
+
+    cond do
+      not (directed? or undirected?) ->
+        :keep_state_and_data
+
+      not tod_can_serve?(data) ->
+        Logger.debug(
+          "ALE Link [#{data.rig_id}] TOD request heard but clock :unsynced; not serving"
+        )
+
+        :keep_state_and_data
+
+      undirected? and not tod_is_net_control?(data) ->
+        # Doctrine: only the Net Control PU answers an undirected request, to
+        # avoid colliding responses. Non-NCS PUs stay silent.
+        :keep_state_and_data
+
+      true ->
+        # Stamp when the request PDU ended (now, at decode) so the response can
+        # be timed T_Confirm later. NOTE: one mailbox hop after true on-air
+        # arrival; sub-ms TX precision would need the native timing path.
+        req_end_mono = System.monotonic_time(:millisecond)
+
+        tod_info = %{
+          caller_addr: if(directed?, do: pdu.caller_addr, else: @broadcast_addr),
+          req_end_mono: req_end_mono,
+          freq_hz: data.current_freq_hz
+        }
+
+        {:next_state, :tod_responding, %{data | tod_info: tod_info}}
+    end
+  end
+
   def scanning(:cast, {:rx_pdu, %PDU.LsuReq{} = pdu}, data) do
     # Received a call while scanning
     if pdu.called_addr == data.self_addr do
-      Logger.info("ALE Link [#{data.rig_id}] received call while scanning on #{format_freq(data.current_freq_hz)} from 0x#{Integer.to_string(pdu.caller_addr, 16)}")
+      Logger.info(
+        "ALE Link [#{data.rig_id}] received call while scanning on #{format_freq(data.current_freq_hz)} from 0x#{Integer.to_string(pdu.caller_addr, 16)}"
+      )
 
-      new_data = %{data |
-        remote_addr: pdu.caller_addr,
-        # Stay on current frequency — we heard the call here
-        call_freq_hz: data.current_freq_hz,
-        link_info: %{
-          caller_addr: pdu.caller_addr,
-          called_addr: pdu.called_addr,
-          voice: pdu.voice,
-          traffic_type: pdu.traffic_type,
-          assigned_subchannels: pdu.assigned_subchannels,
-          occupied_subchannels: pdu.occupied_subchannels,
-          rx_snr: nil,
-          freq_hz: data.current_freq_hz
-        }
+      new_data = %{
+        data
+        | remote_addr: pdu.caller_addr,
+          # Stay on current frequency — we heard the call here
+          call_freq_hz: data.current_freq_hz,
+          link_info: %{
+            caller_addr: pdu.caller_addr,
+            called_addr: pdu.called_addr,
+            voice: pdu.voice,
+            traffic_type: pdu.traffic_type,
+            assigned_subchannels: pdu.assigned_subchannels,
+            occupied_subchannels: pdu.occupied_subchannels,
+            rx_snr: nil,
+            freq_hz: data.current_freq_hz
+          }
       }
 
-      {:next_state, :lbr, new_data,
-       [{:state_timeout, data.timing.t_lbr, :lbr_complete}]}
+      {:next_state, :lbr, new_data, [{:state_timeout, data.timing.t_lbr, :lbr_complete}]}
     else
       :keep_state_and_data
     end
@@ -681,19 +854,27 @@ defmodule Minutewave.ALE.Link do
     if channels == [] do
       {:keep_state_and_data, [{:reply, from, {:error, :no_channels}}]}
     else
-      queue = Enum.map(channels, fn ch ->
-        freq = channel_freq(ch)
-        symbols = Sounder.build_sounding_frame(data.self_addr, waveform: waveform, include_probe: true)
-        %{freq_hz: freq, symbols: symbols}
-      end)
+      queue =
+        Enum.map(channels, fn ch ->
+          freq = channel_freq(ch)
 
-      Logger.info("ALE Link [#{data.rig_id}] manual sounding from scan: #{length(queue)} channels")
+          symbols =
+            Sounder.build_sounding_frame(data.self_addr, waveform: waveform, include_probe: true)
 
-      new_data = %{data |
-        sounding_queue: queue,
-        sounding_return_state: :scanning,
-        waveform: waveform,
-        pending_call: nil  # Cancel pending call — sounding takes priority
+          %{freq_hz: freq, symbols: symbols}
+        end)
+
+      Logger.info(
+        "ALE Link [#{data.rig_id}] manual sounding from scan: #{length(queue)} channels"
+      )
+
+      new_data = %{
+        data
+        | sounding_queue: queue,
+          sounding_return_state: :scanning,
+          waveform: waveform,
+          # Cancel pending call — sounding takes priority
+          pending_call: nil
       }
 
       {:next_state, :sounding, new_data, [{:reply, from, :ok}]}
@@ -704,7 +885,10 @@ defmodule Minutewave.ALE.Link do
   def scanning(:info, {:sounding_fire, expected_freq}, data) do
     if data.current_freq_hz == expected_freq and not Map.get(data, :rx_hold, false) do
       if Receiver.channel_busy?(data.rig_id) do
-        Logger.info("ALE Link [#{data.rig_id}] sounding skipped: channel busy on #{format_freq(expected_freq)}")
+        Logger.info(
+          "ALE Link [#{data.rig_id}] sounding skipped: channel busy on #{format_freq(expected_freq)}"
+        )
+
         :keep_state_and_data
       else
         Logger.info("ALE Link [#{data.rig_id}] sounding TX on #{format_freq(expected_freq)}")
@@ -725,20 +909,48 @@ defmodule Minutewave.ALE.Link do
   @max_rx_hold_ms 15_000
 
   def scanning(:cast, :signal_onset, data) do
-    Logger.info("ALE Link [#{data.rig_id}] scan: signal detected on #{format_freq(data.current_freq_hz)}, holding channel")
-    {:keep_state, Map.put(data, :rx_hold, true), [{:state_timeout, @max_rx_hold_ms, :dwell_timeout}]}
+    Logger.info(
+      "ALE Link [#{data.rig_id}] scan: signal detected on #{format_freq(data.current_freq_hz)}, holding channel"
+    )
+
+    {:keep_state, Map.put(data, :rx_hold, true),
+     [{:state_timeout, @max_rx_hold_ms, :dwell_timeout}]}
   end
 
   # Signal offset — resume normal dwell timing.
   def scanning(:cast, :signal_offset, data) do
-    Logger.info("ALE Link [#{data.rig_id}] scan: signal ended on #{format_freq(data.current_freq_hz)}, resuming scan")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] scan: signal ended on #{format_freq(data.current_freq_hz)}, resuming scan"
+    )
+
     # Give a short grace period for decode + rx_pdu delivery before hopping
     {:keep_state, Map.delete(data, :rx_hold), [{:state_timeout, 200, :dwell_timeout}]}
   end
 
   # Catch-all for scanning state — log anything unexpected
+  def scanning(:cast, :request_tod, data) do
+    # Initiate an undirected TOD request: an async LSU call with Traffic Type =
+    # TOD (63) to the all-ones broadcast address, on the current frequency. The
+    # `calling` state stamps tod_req_end_mono; a returning TodResponse is
+    # handled there (6b), disciplining the clock.
+    Logger.info("ALE Link [#{data.rig_id}] initiating undirected TOD request (clock :unsynced)")
+
+    new_data = %{
+      data
+      | remote_addr: @broadcast_addr,
+        call_freq_hz: data.current_freq_hz,
+        call_opts: %{traffic_type: 63, waveform: :fast, tuner_time_ms: 50},
+        waveform: :fast
+    }
+
+    {:next_state, :calling, new_data}
+  end
+
   def scanning(event_type, event_content, data) do
-    Logger.info("ALE Link [#{data.rig_id}] scanning: unhandled #{inspect(event_type)} #{inspect(event_content)}")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] scanning: unhandled #{inspect(event_type)} #{inspect(event_content)}"
+    )
+
     :keep_state_and_data
   end
 
@@ -753,7 +965,10 @@ defmodule Minutewave.ALE.Link do
   # -------------------------------------------------------------------
 
   def sounding(:enter, _old_state, data) do
-    Logger.info("ALE Link [#{data.rig_id}] entering SOUNDING: #{length(data.sounding_queue)} channels queued")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] entering SOUNDING: #{length(data.sounding_queue)} channels queued"
+    )
+
     broadcast_state_change(data.rig_id, :sounding, %{
       remaining: length(data.sounding_queue),
       total: length(data.sounding_queue)
@@ -765,12 +980,16 @@ defmodule Minutewave.ALE.Link do
 
   def sounding(:state_timeout, :sounding_next, %{sounding_queue: []} = data) do
     # Queue exhausted — return to previous state
-    Logger.info("ALE Link [#{data.rig_id}] sounding complete, returning to #{data.sounding_return_state}")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] sounding complete, returning to #{data.sounding_return_state}"
+    )
+
     broadcast_event(data.rig_id, :sounding_complete, %{})
 
     case data.sounding_return_state do
       :scanning ->
         {:next_state, :scanning, %{data | sounding_queue: [], sounding_return_state: nil}}
+
       _ ->
         {:next_state, :idle, %{data | sounding_queue: [], sounding_return_state: nil}}
     end
@@ -779,15 +998,14 @@ defmodule Minutewave.ALE.Link do
   def sounding(:state_timeout, :sounding_next, data) do
     [current | rest] = data.sounding_queue
 
-    Logger.info("ALE Link [#{data.rig_id}] sounding: tuning to #{format_freq(current.freq_hz)}, #{length(rest)} remaining")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] sounding: tuning to #{format_freq(current.freq_hz)}, #{length(rest)} remaining"
+    )
 
     # Tune to the target frequency
     tune_rig(data.rig_id, current.freq_hz)
 
-    new_data = %{data |
-      current_freq_hz: current.freq_hz,
-      sounding_queue: rest
-    }
+    new_data = %{data | current_freq_hz: current.freq_hz, sounding_queue: rest}
 
     broadcast_state_change(data.rig_id, :sounding, %{
       freq_hz: current.freq_hz,
@@ -812,14 +1030,19 @@ defmodule Minutewave.ALE.Link do
     new_schedule = Sounder.record_sounding_tx(data.sounding_schedule, current.freq_hz)
 
     # Persist the TX sounding to the LQA database
-    Minutewave.Modem.Events.broadcast(data.rig_id, {:ale, {:sounding_made, %{
-      self_addr: data.self_addr,
-      freq_hz: current.freq_hz,
-      rig_id: data.rig_id,
-      direction: :tx,
-      frame_type: :sounding,
-      source: :sounding
-    }}})
+    Minutewave.Modem.Events.broadcast(
+      data.rig_id,
+      {:ale,
+       {:sounding_made,
+        %{
+          self_addr: data.self_addr,
+          freq_hz: current.freq_hz,
+          rig_id: data.rig_id,
+          direction: :tx,
+          frame_type: :sounding,
+          source: :sounding
+        }}}
+    )
 
     new_data = %{data | sounding_schedule: new_schedule}
 
@@ -835,6 +1058,7 @@ defmodule Minutewave.ALE.Link do
       freq_hz: data.current_freq_hz,
       return_state: data.sounding_return_state
     }
+
     {:keep_state_and_data, [{:reply, from, {:sounding, info}}]}
   end
 
@@ -849,25 +1073,25 @@ defmodule Minutewave.ALE.Link do
     if pdu.called_addr == data.self_addr do
       Logger.info("ALE Link [#{data.rig_id}] received call during sounding, aborting to respond")
 
-      new_data = %{data |
-        remote_addr: pdu.caller_addr,
-        call_freq_hz: data.current_freq_hz,
-        sounding_queue: [],
-        sounding_return_state: nil,
-        link_info: %{
-          caller_addr: pdu.caller_addr,
-          called_addr: pdu.called_addr,
-          voice: pdu.voice,
-          traffic_type: pdu.traffic_type,
-          assigned_subchannels: pdu.assigned_subchannels,
-          occupied_subchannels: pdu.occupied_subchannels,
-          rx_snr: nil,
-          freq_hz: data.current_freq_hz
-        }
+      new_data = %{
+        data
+        | remote_addr: pdu.caller_addr,
+          call_freq_hz: data.current_freq_hz,
+          sounding_queue: [],
+          sounding_return_state: nil,
+          link_info: %{
+            caller_addr: pdu.caller_addr,
+            called_addr: pdu.called_addr,
+            voice: pdu.voice,
+            traffic_type: pdu.traffic_type,
+            assigned_subchannels: pdu.assigned_subchannels,
+            occupied_subchannels: pdu.occupied_subchannels,
+            rx_snr: nil,
+            freq_hz: data.current_freq_hz
+          }
       }
 
-      {:next_state, :lbr, new_data,
-       [{:state_timeout, data.timing.t_lbr, :lbr_complete}]}
+      {:next_state, :lbr, new_data, [{:state_timeout, data.timing.t_lbr, :lbr_complete}]}
     else
       :keep_state_and_data
     end
@@ -896,7 +1120,12 @@ defmodule Minutewave.ALE.Link do
 
   def lbt(:enter, _old_state, data) do
     Logger.debug("ALE Link [#{data.rig_id}] entering LBT on #{format_freq(data.call_freq_hz)}")
-    broadcast_state_change(data.rig_id, :lbt, %{remote_addr: data.remote_addr, freq_hz: data.call_freq_hz})
+
+    broadcast_state_change(data.rig_id, :lbt, %{
+      remote_addr: data.remote_addr,
+      freq_hz: data.call_freq_hz
+    })
+
     :keep_state_and_data
   end
 
@@ -937,7 +1166,11 @@ defmodule Minutewave.ALE.Link do
 
   def calling(:enter, _old_state, data) do
     Logger.debug("ALE Link [#{data.rig_id}] entering CALLING")
-    broadcast_state_change(data.rig_id, :calling, %{remote_addr: data.remote_addr, freq_hz: data.call_freq_hz})
+
+    broadcast_state_change(data.rig_id, :calling, %{
+      remote_addr: data.remote_addr,
+      freq_hz: data.call_freq_hz
+    })
 
     # Ensure we're on the call frequency
     tune_rig(data.rig_id, data.call_freq_hz)
@@ -945,7 +1178,10 @@ defmodule Minutewave.ALE.Link do
     # Build and transmit LSU_Req using selected waveform
     waveform = Map.get(data.call_opts, :waveform, data.waveform)
     tuner_time_ms = Map.get(data.call_opts, :tuner_time_ms, 50)
-    Logger.info("ALE Link [#{data.rig_id}] calling: waveform=#{waveform}, freq=#{format_freq(data.call_freq_hz)}, tuner_time_ms=#{tuner_time_ms}")
+
+    Logger.info(
+      "ALE Link [#{data.rig_id}] calling: waveform=#{waveform}, freq=#{format_freq(data.call_freq_hz)}, tuner_time_ms=#{tuner_time_ms}"
+    )
 
     pdu = %PDU.LsuReq{
       caller_addr: data.self_addr,
@@ -958,15 +1194,18 @@ defmodule Minutewave.ALE.Link do
 
     pdu_binary = PDU.encode(pdu)
 
-    symbols = Waveform.assemble_frame(pdu_binary,
-      waveform: waveform,
-      include_probe: true,
-      tuner_time_ms: tuner_time_ms,
-      capture_probe_count: 1,
-      preamble_count: 1
-    )
+    symbols =
+      Waveform.assemble_frame(pdu_binary,
+        waveform: waveform,
+        include_probe: true,
+        tuner_time_ms: tuner_time_ms,
+        capture_probe_count: 1,
+        preamble_count: 1
+      )
 
-    Logger.info("ALE Link [#{data.rig_id}] LsuReq frame: pdu=#{byte_size(pdu_binary)} bytes, symbols=#{length(symbols)}")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] LsuReq frame: pdu=#{byte_size(pdu_binary)} bytes, symbols=#{length(symbols)}"
+    )
 
     # Send to modulator
     transmit_frame(data.rig_id, symbols)
@@ -975,11 +1214,24 @@ defmodule Minutewave.ALE.Link do
     timing = Waveform.frame_timing(pdu_binary, waveform: waveform, tuner_time_ms: tuner_time_ms)
     response_timeout = round(timing.duration_ms) + data.timing.t_response
 
-    {:keep_state_and_data, [{:state_timeout, response_timeout, :response_timeout}]}
+    # For a TOD request (Traffic Type = TOD), stamp when our request PDU ends,
+    # so we can measure T_Elapsed to the response arrival (G.5.7.4.3). The end
+    # is now (enter, ~TX start) plus the on-air duration of the request PDU.
+    data =
+      if pdu.traffic_type == Minutewave.ALE.Tod.traffic_type_tod() do
+        req_end = System.monotonic_time(:millisecond) + round(timing.duration_ms)
+        %{data | tod_req_end_mono: req_end}
+      else
+        data
+      end
+
+    {:keep_state, data, [{:state_timeout, response_timeout, :response_timeout}]}
   end
 
   def calling(:state_timeout, :response_timeout, data) do
-    Logger.warning("ALE Link [#{data.rig_id}] no response from 0x#{Integer.to_string(data.remote_addr, 16)}")
+    Logger.warning(
+      "ALE Link [#{data.rig_id}] no response from 0x#{Integer.to_string(data.remote_addr, 16)}"
+    )
 
     send_terminate(data, PDU.LsuTerm.reason_timeout())
 
@@ -987,9 +1239,80 @@ defmodule Minutewave.ALE.Link do
     {:next_state, :idle, data}
   end
 
+  def calling(:cast, {:rx_pdu, %PDU.TodResponse{} = pdu}, data) do
+    # Requester side of the TOD exchange (G.5.7.4.3). We measure T_Elapsed from
+    # the end of our request PDU to this response's arrival, back out T_prop and
+    # our slot error via Tod.Timing.recover/7, and discipline the clock.
+    resp_arrival = System.monotonic_time(:millisecond)
+
+    cond do
+      is_nil(data.tod_req_end_mono) ->
+        # We weren't expecting a TOD response; ignore.
+        :keep_state_and_data
+
+      true ->
+        t_elapsed = resp_arrival - data.tod_req_end_mono
+        waveform = Map.get(data.call_opts, :waveform, data.waveform)
+        # On-air payload duration of the response PDU. Use the request's frame
+        # timing as a proxy (same PDU size/waveform class); refine when the
+        # response's actual payload timing is available.
+        t_payload = Map.get(data.call_opts, :tod_payload_ms, 0)
+
+        case Minutewave.ALE.Tod.Timing.recover(
+               t_elapsed,
+               pdu.sync_mag,
+               pdu.sync_sign,
+               pdu.sync_tq,
+               waveform,
+               t_payload,
+               %Minutewave.ALE.Tod.Timing.Config{}
+             ) do
+          {:ok, rec} ->
+            # Reconstruct absolute protocol time from the response Min/Sec,
+            # anchored to our own current hour (TOD is a within-hour phase
+            # correction), then apply the recovered slot correction.
+            now_ms = Minutewave.Clock.protocol_time_ms()
+            hour_base = div(now_ms, 3_600_000) * 3_600_000
+            within = pdu.coarse_min * 60_000 + pdu.coarse_sec * 1_000
+            candidate = hour_base + within
+
+            proto_ms =
+              cond do
+                candidate - now_ms > 1_800_000 -> candidate - 3_600_000
+                now_ms - candidate > 1_800_000 -> candidate + 3_600_000
+                true -> candidate
+              end
+
+            proto_ms = round(proto_ms + rec.slot_correction_ms)
+
+            fix = %{
+              protocol_time_ms: proto_ms,
+              mono_ms: resp_arrival,
+              uncertainty_ms: normalize_unc(rec.uncertainty_ms),
+              stratum: pdu.sync_tq
+            }
+
+            Minutewave.Clock.discipline_tod(fix)
+
+            Logger.info(
+              "ALE Link [#{data.rig_id}] TOD recovered: t_prop=#{Float.round(rec.t_prop_ms / 1, 1)}ms " <>
+                "slot_corr=#{Float.round(rec.slot_correction_ms / 1, 1)}ms unc=#{inspect(rec.uncertainty_ms)}"
+            )
+
+            {:next_state, :scanning, %{data | tod_req_end_mono: nil}}
+
+          {:error, reason} ->
+            Logger.warning("ALE Link [#{data.rig_id}] TOD recovery failed: #{inspect(reason)}")
+            {:next_state, :scanning, %{data | tod_req_end_mono: nil}}
+        end
+    end
+  end
+
   def calling(:cast, {:rx_pdu, %PDU.LsuConf{} = pdu}, data) do
     if pdu.caller_addr == data.self_addr and pdu.called_addr == data.remote_addr do
-      Logger.info("ALE Link [#{data.rig_id}] received confirm from 0x#{Integer.to_string(data.remote_addr, 16)}")
+      Logger.info(
+        "ALE Link [#{data.rig_id}] received confirm from 0x#{Integer.to_string(data.remote_addr, 16)}"
+      )
 
       link_info = %{
         caller_addr: data.self_addr,
@@ -1046,7 +1369,12 @@ defmodule Minutewave.ALE.Link do
 
   def lbr(:enter, _old_state, data) do
     Logger.debug("ALE Link [#{data.rig_id}] entering LBR on #{format_freq(data.current_freq_hz)}")
-    broadcast_state_change(data.rig_id, :lbr, %{remote_addr: data.remote_addr, freq_hz: data.current_freq_hz})
+
+    broadcast_state_change(data.rig_id, :lbr, %{
+      remote_addr: data.remote_addr,
+      freq_hz: data.current_freq_hz
+    })
+
     :keep_state_and_data
   end
 
@@ -1079,9 +1407,98 @@ defmodule Minutewave.ALE.Link do
   # State: RESPONDING
   # -------------------------------------------------------------------
 
+  # -------------------------------------------------------------------
+  # State: TOD_RESPONDING
+  #
+  # Serve a TOD Request (G.5.7.4.3). Mirrors `responding`'s T_Confirm-delayed
+  # transmit, but emits a TodResponse and returns to scanning (TOD does not
+  # establish a link).
+  # -------------------------------------------------------------------
+
+  def tod_responding(:enter, _old_state, data) do
+    Logger.debug("ALE Link [#{data.rig_id}] entering TOD_RESPONDING")
+    t_confirm = data.timing.t_tune + data.timing.t_handshake
+    elapsed = System.monotonic_time(:millisecond) - data.tod_info.req_end_mono
+    delay = max(t_confirm - elapsed, 0)
+    {:keep_state_and_data, [{:state_timeout, delay, :send_tod_response}]}
+  end
+
+  def tod_responding(:state_timeout, :send_tod_response, data) do
+    # Min/Sec = minute/second at which this PDU begins (now). Sync Offset/Sign
+    # describe the requester's slot error; with no measured per-request slot
+    # delta yet we report :no_report (255) and Sign 0. TQ advertises our own
+    # current time quality (Table G-XVII).
+    now_ms = Minutewave.Clock.protocol_time_ms()
+    {_q, unc} = Minutewave.Clock.quality()
+    tq = Minutewave.ALE.Tod.uncertainty_ms_to_tq(unc)
+
+    pdu = %PDU.TodResponse{
+      responder_addr: data.self_addr,
+      caller_addr: data.tod_info.caller_addr,
+      coarse_min: div(rem(now_ms, 3_600_000), 60_000),
+      coarse_sec: div(rem(now_ms, 60_000), 1000),
+      sync_mag: Minutewave.ALE.Tod.sync_offset_no_report(),
+      sync_sign: 0,
+      sync_tq: tq
+    }
+
+    pdu_binary = PDU.encode(pdu)
+
+    symbols =
+      Waveform.assemble_frame(pdu_binary,
+        waveform: data.waveform,
+        include_probe: true,
+        tuner_time_ms: data.timing.t_tune
+      )
+
+    Logger.info(
+      "ALE Link [#{data.rig_id}] TodResponse frame: tq=#{tq}, pdu=#{byte_size(pdu_binary)} bytes"
+    )
+
+    transmit_frame(data.rig_id, symbols)
+
+    {:next_state, :scanning, %{data | tod_info: nil}}
+  end
+
+  def tod_responding(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
+  def tod_responding(:cast, :signal_onset, _data), do: :keep_state_and_data
+  def tod_responding(:cast, :signal_offset, _data), do: :keep_state_and_data
+
+  def tod_responding(event_type, event_content, data) do
+    Logger.info(
+      "ALE Link [#{data.rig_id}] tod_responding: unhandled #{inspect(event_type)} #{inspect(event_content)}"
+    )
+
+    :keep_state_and_data
+  end
+
+  # -------------------------------------------------------------------
+  # TOD serve-eligibility helpers (G.5.7.4.3)
+  # -------------------------------------------------------------------
+
+  # We may serve TOD only if our own clock is not :unsynced.
+  defp normalize_unc(:infinity), do: 3_600_000
+  defp normalize_unc(ms) when is_integer(ms), do: ms
+
+  defp tod_can_serve?(_data) do
+    case Minutewave.Clock.quality() do
+      {:unsynced, _} -> false
+      {_, _} -> true
+    end
+  end
+
+  # We are the Net Control PU iff configured as such (net_control_addr == self).
+  defp tod_is_net_control?(data), do: data.net_control_addr == data.self_addr
+
   def responding(:enter, _old_state, data) do
-    Logger.debug("ALE Link [#{data.rig_id}] entering RESPONDING on #{format_freq(data.current_freq_hz)}")
-    broadcast_state_change(data.rig_id, :responding, %{remote_addr: data.remote_addr, freq_hz: data.current_freq_hz})
+    Logger.debug(
+      "ALE Link [#{data.rig_id}] entering RESPONDING on #{format_freq(data.current_freq_hz)}"
+    )
+
+    broadcast_state_change(data.rig_id, :responding, %{
+      remote_addr: data.remote_addr,
+      freq_hz: data.current_freq_hz
+    })
 
     t_confirm = data.timing.t_tune + data.timing.t_handshake
     {:keep_state_and_data, [{:state_timeout, t_confirm, :send_confirm}]}
@@ -1100,22 +1517,26 @@ defmodule Minutewave.ALE.Link do
 
     pdu_binary = PDU.encode(pdu)
 
-    symbols = Waveform.assemble_frame(pdu_binary,
-      waveform: data.waveform,
-      include_probe: true,
-      tuner_time_ms: data.timing.t_tune
-    )
+    symbols =
+      Waveform.assemble_frame(pdu_binary,
+        waveform: data.waveform,
+        include_probe: true,
+        tuner_time_ms: data.timing.t_tune
+      )
 
-    Logger.info("ALE Link [#{data.rig_id}] LsuConf frame: pdu=#{byte_size(pdu_binary)} bytes, symbols=#{length(symbols)}")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] LsuConf frame: pdu=#{byte_size(pdu_binary)} bytes, symbols=#{length(symbols)}"
+    )
 
     transmit_frame(data.rig_id, symbols)
 
-    link_info = Map.merge(data.link_info, %{
-      tx_subchannels: 0xFFFF,
-      rx_subchannels: 0xFFFF,
-      we_are: :responder,
-      freq_hz: data.current_freq_hz
-    })
+    link_info =
+      Map.merge(data.link_info, %{
+        tx_subchannels: 0xFFFF,
+        rx_subchannels: 0xFFFF,
+        we_are: :responder,
+        freq_hz: data.current_freq_hz
+      })
 
     new_data = %{data | link_info: link_info}
     {:next_state, :linked, new_data}
@@ -1141,19 +1562,29 @@ defmodule Minutewave.ALE.Link do
 
   def linked(:enter, _old_state, data) do
     freq = data.current_freq_hz || Map.get(data.link_info || %{}, :freq_hz)
-    Logger.info("ALE Link [#{data.rig_id}] LINKED with 0x#{Integer.to_string(data.remote_addr, 16)} on #{format_freq(freq)}")
+
+    Logger.info(
+      "ALE Link [#{data.rig_id}] LINKED with 0x#{Integer.to_string(data.remote_addr, 16)} on #{format_freq(freq)}"
+    )
+
     broadcast_state_change(data.rig_id, :linked, data.link_info)
 
     # Auto-terminate LQA exchange links (G.5.5.10.2)
     # If we initiated an LQA exchange, terminate immediately after link is established.
-    traffic_type = get_in(data, [:call_opts, :traffic_type]) || get_in(data, [:link_info, :traffic_type])
+    traffic_type =
+      get_in(data, [:call_opts, :traffic_type]) || get_in(data, [:link_info, :traffic_type])
+
     if traffic_type == Sounder.traffic_type_lqa_exchange() do
       # Wait for the LsuConf frame to finish playing out before sending LsuTerm.
       # The LsuConf was just queued to the audio pipeline but hasn't finished TX yet.
       # Deep WALE ~2885ms, Fast WALE ~400ms
       conf_tx_ms = if data.waveform == :deep, do: 3000, else: 500
       delay_ms = conf_tx_ms + 500
-      Logger.info("ALE Link [#{data.rig_id}] LQA exchange complete, auto-terminating in #{delay_ms}ms")
+
+      Logger.info(
+        "ALE Link [#{data.rig_id}] LQA exchange complete, auto-terminating in #{delay_ms}ms"
+      )
+
       {:keep_state_and_data, [{:state_timeout, delay_ms, :lqa_exchange_terminate}]}
     else
       {:keep_state_and_data, [{:state_timeout, data.timing.t_activity, :activity_timeout}]}
@@ -1226,7 +1657,9 @@ defmodule Minutewave.ALE.Link do
     # Set frequency on Rig.Control (drives rigctld for physical rigs,
     # no-op for test/simulator backends)
     case safe_call(fn -> Control.set_frequency(rig_id, freq_hz) end) do
-      :ok -> :ok
+      :ok ->
+        :ok
+
       {:error, reason} ->
         Logger.warning("ALE Link [#{rig_id}] Control.set_frequency failed: #{inspect(reason)}")
     end
@@ -1235,7 +1668,8 @@ defmodule Minutewave.ALE.Link do
     # this tunes the simnet combiner's frequency filter)
     case safe_call(fn -> SimnetBridge.set_frequency(rig_id, freq_hz) end) do
       :ok -> :ok
-      _ -> :ok  # SimnetBridge may not be running for physical rigs
+      # SimnetBridge may not be running for physical rigs
+      _ -> :ok
     end
 
     :ok
@@ -1286,13 +1720,16 @@ defmodule Minutewave.ALE.Link do
 
     pdu_binary = PDU.encode(pdu)
 
-    symbols = Waveform.assemble_frame(pdu_binary,
-      waveform: data.waveform,
-      include_probe: true,
-      tuner_time_ms: data.timing.t_tune
-    )
+    symbols =
+      Waveform.assemble_frame(pdu_binary,
+        waveform: data.waveform,
+        include_probe: true,
+        tuner_time_ms: data.timing.t_tune
+      )
 
-    Logger.info("ALE Link [#{data.rig_id}] LsuTerm frame: pdu=#{byte_size(pdu_binary)} bytes, symbols=#{length(symbols)}")
+    Logger.info(
+      "ALE Link [#{data.rig_id}] LsuTerm frame: pdu=#{byte_size(pdu_binary)} bytes, symbols=#{length(symbols)}"
+    )
 
     transmit_frame(data.rig_id, symbols)
   end
@@ -1310,8 +1747,12 @@ defmodule Minutewave.ALE.Link do
   defp lqa_best_freq(rig_id, dest_addr, channels) do
     case LQA.best_channel(rig_id, dest_addr, channels) do
       %{freq_hz: freq, score: score} when score > 0 ->
-        Logger.info("ALE Link [#{rig_id}] LQA selected #{format_freq(freq)} (score=#{score}) for 0x#{Integer.to_string(dest_addr, 16)}")
+        Logger.info(
+          "ALE Link [#{rig_id}] LQA selected #{format_freq(freq)} (score=#{score}) for 0x#{Integer.to_string(dest_addr, 16)}"
+        )
+
         freq
+
       _ ->
         nil
     end
@@ -1328,21 +1769,36 @@ defmodule Minutewave.ALE.Link do
   # on the same net dwell on the same channel simultaneously.
   # Async: single-channel, ad-hoc, or free-running scan.
   defp sync_scan?(data) do
-    length(data.channels) > 1 and data.scan_mode in [:ale_4g, :ale_3g]
+    length(data.channels) > 1 and data.scan_mode in [:ale_4g, :ale_3g] and
+      data.clock_sync_ok
+  end
+
+  # Map clock authority quality to a sync-scan admissibility boolean.
+  # :locked and :holdover are both within the time-error guard (G.8275.1
+  # "holdover-in-specification"): lockstep alignment is still valid.
+  # :unsynced means accumulated uncertainty has exceeded the guard band —
+  # degrade to async / shared pool.
+  defp clock_permits_sync?() do
+    case Minutewave.Clock.quality() do
+      {:unsynced, _} -> false
+      {_quality, _unc} -> true
+    end
   end
 
   # Schedule a sounding early in the dwell if conditions are met.
   # Uses address-based stagger to avoid collisions between stations.
   defp maybe_schedule_sounding(%{sounding_enabled: false} = data, _remaining_dwell), do: data
   defp maybe_schedule_sounding(%{current_freq_hz: nil} = data, _remaining_dwell), do: data
+
   defp maybe_schedule_sounding(data, remaining_dwell) do
-    should = Sounder.should_sound?(
-      data.sounding_schedule,
-      data.current_freq_hz,
-      min_interval_s: data.sounding_interval_s,
-      soundings_this_cycle: data.soundings_this_cycle,
-      max_per_cycle: length(data.channels)
-    )
+    should =
+      Sounder.should_sound?(
+        data.sounding_schedule,
+        data.current_freq_hz,
+        min_interval_s: data.sounding_interval_s,
+        soundings_this_cycle: data.soundings_this_cycle,
+        max_per_cycle: length(data.channels)
+      )
 
     if should do
       # Random delay within [200, remaining_dwell - 3000] to spread soundings.
@@ -1353,7 +1809,10 @@ defmodule Minutewave.ALE.Link do
 
       if delay_ms + 3000 < remaining_dwell do
         # Enough room for the sounding frame within this dwell
-        Logger.info("ALE Link [#{data.rig_id}] sounding scheduled in #{delay_ms}ms on #{format_freq(data.current_freq_hz)}")
+        Logger.info(
+          "ALE Link [#{data.rig_id}] sounding scheduled in #{delay_ms}ms on #{format_freq(data.current_freq_hz)}"
+        )
+
         Process.send_after(self(), {:sounding_fire, data.current_freq_hz}, delay_ms)
         data
       else
@@ -1368,6 +1827,7 @@ defmodule Minutewave.ALE.Link do
   # Dispatches to sync or async path based on scan mode.
   defp maybe_sound_inline(%{sounding_enabled: false} = data), do: data
   defp maybe_sound_inline(%{current_freq_hz: nil} = data), do: data
+
   defp maybe_sound_inline(data) do
     if sync_scan?(data) do
       maybe_sound_sync(data)
@@ -1382,21 +1842,28 @@ defmodule Minutewave.ALE.Link do
   # sound shall be sent when the network is dwelling on that channel."
   # No capture probe needed — everyone is already listening.
   defp maybe_sound_sync(data) do
-    should = Sounder.should_sound?(
-      data.sounding_schedule,
-      data.current_freq_hz,
-      min_interval_s: data.sounding_interval_s,
-      soundings_this_cycle: data.soundings_this_cycle,
-      max_per_cycle: length(data.channels)
-    )
+    should =
+      Sounder.should_sound?(
+        data.sounding_schedule,
+        data.current_freq_hz,
+        min_interval_s: data.sounding_interval_s,
+        soundings_this_cycle: data.soundings_this_cycle,
+        max_per_cycle: length(data.channels)
+      )
 
     if should do
       # LBT: check receiver for energy on this channel (G.5.5.10.1(a))
       if Receiver.channel_busy?(data.rig_id) do
-        Logger.debug("ALE Link [#{data.rig_id}] sync sounding skipped: channel busy on #{format_freq(data.current_freq_hz)}")
+        Logger.debug(
+          "ALE Link [#{data.rig_id}] sync sounding skipped: channel busy on #{format_freq(data.current_freq_hz)}"
+        )
+
         data
       else
-        Logger.info("ALE Link [#{data.rig_id}] sync sounding on #{format_freq(data.current_freq_hz)}")
+        Logger.info(
+          "ALE Link [#{data.rig_id}] sync sounding on #{format_freq(data.current_freq_hz)}"
+        )
+
         do_sounding_tx(data, data.current_freq_hz, _async = false)
       end
     else
@@ -1411,7 +1878,8 @@ defmodule Minutewave.ALE.Link do
   # We tune away from the current scan channel, sound, and return.
   defp maybe_sound_async(data) do
     case Sounder.next_sounding_target(data.sounding_schedule, data.channels,
-           stale_threshold_s: data.sounding_interval_s) do
+           stale_threshold_s: data.sounding_interval_s
+         ) do
       nil ->
         # All channels are fresh — nothing to do
         data
@@ -1421,7 +1889,9 @@ defmodule Minutewave.ALE.Link do
         if data.soundings_this_cycle >= length(data.channels) do
           data
         else
-          Logger.info("ALE Link [#{data.rig_id}] async sounding detour to #{format_freq(target_freq)}")
+          Logger.info(
+            "ALE Link [#{data.rig_id}] async sounding detour to #{format_freq(target_freq)}"
+          )
 
           # Tune to target
           tune_rig(data.rig_id, target_freq)
@@ -1431,7 +1901,10 @@ defmodule Minutewave.ALE.Link do
           Process.sleep(div(data.timing.t_lbt, 2))
 
           if Receiver.channel_busy?(data.rig_id) do
-            Logger.debug("ALE Link [#{data.rig_id}] async sounding skipped: channel busy on #{format_freq(target_freq)}")
+            Logger.debug(
+              "ALE Link [#{data.rig_id}] async sounding skipped: channel busy on #{format_freq(target_freq)}"
+            )
+
             # Tune back — the caller (dwell_timeout) will tune to the next scan channel
             data
           else
@@ -1443,30 +1916,34 @@ defmodule Minutewave.ALE.Link do
 
   # Common TX path for both sync and async sounding.
   defp do_sounding_tx(data, freq_hz, _include_probe) do
-    symbols = Sounder.build_sounding_frame(data.self_addr,
-      waveform: data.sounding_waveform,
-      include_probe: true
-    )
+    symbols =
+      Sounder.build_sounding_frame(data.self_addr,
+        waveform: data.sounding_waveform,
+        include_probe: true
+      )
+
     transmit_frame(data.rig_id, symbols)
 
     new_schedule = Sounder.record_sounding_tx(data.sounding_schedule, freq_hz)
 
     # Persist to DB (don't block scan on failure)
-    Minutewave.Modem.Events.broadcast(data.rig_id, {:ale, {:sounding_made, %{
-      self_addr: data.self_addr,
-      freq_hz: freq_hz,
-      rig_id: data.rig_id,
-      direction: :tx,
-      frame_type: :sounding,
-      source: :sounding
-    }}})
+    Minutewave.Modem.Events.broadcast(
+      data.rig_id,
+      {:ale,
+       {:sounding_made,
+        %{
+          self_addr: data.self_addr,
+          freq_hz: freq_hz,
+          rig_id: data.rig_id,
+          direction: :tx,
+          frame_type: :sounding,
+          source: :sounding
+        }}}
+    )
 
     broadcast_event(data.rig_id, :sounding_tx, %{freq_hz: freq_hz, include_probe: true})
 
-    %{data |
-      sounding_schedule: new_schedule,
-      soundings_this_cycle: data.soundings_this_cycle + 1
-    }
+    %{data | sounding_schedule: new_schedule, soundings_this_cycle: data.soundings_this_cycle + 1}
   end
 
   # --- Scan configuration resolution ---
@@ -1507,34 +1984,43 @@ defmodule Minutewave.ALE.Link do
     net = if net_id, do: Map.get(data.nets || %{}, net_id), else: nil
 
     # Resolve channels
-    channels = cond do
-      explicit_channels ->
-        normalize_channels(explicit_channels)
-      net ->
-        normalize_channels(net.channels)
-      true ->
-        data.channels
-    end
+    channels =
+      cond do
+        explicit_channels ->
+          normalize_channels(explicit_channels)
+
+        net ->
+          normalize_channels(net.channels)
+
+        true ->
+          data.channels
+      end
 
     # Resolve scan mode — explicit > net type > default
-    resolved_mode = cond do
-      scan_mode ->
-        scan_mode
-      net ->
-        parse_scan_mode(net.net_type)
-      true ->
-        :ale_4g
-    end
+    resolved_mode =
+      cond do
+        scan_mode ->
+          scan_mode
+
+        net ->
+          parse_scan_mode(net.net_type)
+
+        true ->
+          :ale_4g
+      end
 
     # Resolve dwell time — explicit > net timing > mode canonical > default
-    resolved_dwell = cond do
-      explicit_dwell ->
-        explicit_dwell
-      net && get_in(net.timing_config, ["scan_dwell_ms"]) ->
-        net.timing_config["scan_dwell_ms"]
-      true ->
-        Map.get(@scan_mode_dwell, resolved_mode, data.timing.scan_dwell_ms)
-    end
+    resolved_dwell =
+      cond do
+        explicit_dwell ->
+          explicit_dwell
+
+        net && get_in(net.timing_config, ["scan_dwell_ms"]) ->
+          net.timing_config["scan_dwell_ms"]
+
+        true ->
+          Map.get(@scan_mode_dwell, resolved_mode, data.timing.scan_dwell_ms)
+      end
 
     %{
       channels: channels,
@@ -1547,29 +2033,33 @@ defmodule Minutewave.ALE.Link do
   end
 
   defp resolve_sounding_enabled(nil, opts), do: Keyword.get(opts, :sounding_enabled, false)
+
   defp resolve_sounding_enabled(net, opts) do
-    Keyword.get(opts, :sounding_enabled,
-      get_in(net.timing_config, ["sounding_enabled"]) || false)
+    Keyword.get(opts, :sounding_enabled, get_in(net.timing_config, ["sounding_enabled"]) || false)
   end
 
   defp resolve_sounding_interval(nil, opts), do: Keyword.get(opts, :sounding_interval_s, 300)
+
   defp resolve_sounding_interval(net, opts) do
-    Keyword.get(opts, :sounding_interval_s,
-      get_in(net.timing_config, ["sounding_interval_s"]) || 300)
+    Keyword.get(
+      opts,
+      :sounding_interval_s,
+      get_in(net.timing_config, ["sounding_interval_s"]) || 300
+    )
   end
 
   defp resolve_sounding_waveform(nil, opts), do: Keyword.get(opts, :sounding_waveform, :deep)
+
   defp resolve_sounding_waveform(net, opts) do
     configured = get_in(net.timing_config, ["sounding_waveform"])
     explicit = Keyword.get(opts, :sounding_waveform)
+
     case explicit || configured do
       "fast" -> :fast
       :fast -> :fast
       _ -> :deep
     end
   end
-
-
 
   # Normalize channel maps to a consistent format.
   # Accepts both string-keyed (from DB) and atom-keyed maps.
@@ -1590,6 +2080,7 @@ defmodule Minutewave.ALE.Link do
   end
 
   defp parse_mode(mode) when is_atom(mode), do: mode
+
   defp parse_mode(mode) when is_binary(mode) do
     try do
       String.to_existing_atom(mode)
@@ -1597,6 +2088,7 @@ defmodule Minutewave.ALE.Link do
       ArgumentError -> :usb
     end
   end
+
   defp parse_mode(_), do: :usb
 
   defp parse_scan_mode("ale_2g"), do: :ale_2g
@@ -1637,16 +2129,18 @@ defmodule Minutewave.ALE.Link do
     ms_into_cycle = rem_nonneg(now_wall - epoch, cycle_len)
     target_dwell_start_in_cycle = call_ch_index * dwell_ms
 
-    time_until_target_dwell = if target_dwell_start_in_cycle > ms_into_cycle do
-      target_dwell_start_in_cycle - ms_into_cycle
-    else
-      target_dwell_start_in_cycle + cycle_len - ms_into_cycle
-    end
+    time_until_target_dwell =
+      if target_dwell_start_in_cycle > ms_into_cycle do
+        target_dwell_start_in_cycle - ms_into_cycle
+      else
+        target_dwell_start_in_cycle + cycle_len - ms_into_cycle
+      end
 
     lbt_lead_time = timing.t_lbt + timing.t_tune
 
     # If the target dwell is too soon for a full LBT, wait for the next cycle
     time_until_lbt = time_until_target_dwell - lbt_lead_time
+
     if time_until_lbt <= 0 do
       now_mono + time_until_target_dwell + cycle_len - lbt_lead_time
     else
@@ -1661,10 +2155,12 @@ defmodule Minutewave.ALE.Link do
   end
 
   defp format_freq(nil), do: "unknown"
+
   defp format_freq(freq_hz) when freq_hz >= 1_000_000 do
     mhz = freq_hz / 1_000_000
     "#{Float.round(mhz, 3)} MHz"
   end
+
   defp format_freq(freq_hz), do: "#{freq_hz} Hz"
 
   # --- Safe calls (swallow noproc for optional processes) ---
@@ -1690,9 +2186,11 @@ defmodule Minutewave.ALE.Link do
 
   defp broadcast(rig_id, message) do
     group = {:minutemodem, :rig, rig_id}
+
     for pid <- :pg.get_members(:minutemodem_pg, group) do
       send(pid, message)
     end
+
     :ok
   rescue
     _ -> :ok

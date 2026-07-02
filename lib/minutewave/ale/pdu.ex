@@ -12,16 +12,20 @@ defmodule Minutewave.ALE.PDU do
 
   import Bitwise
 
-  # Protocol identifiers (3 bits)
+  # Protocol identifiers (3 bits) -- per MIL-STD-188-141D Table G-XI
+  @proto_text 0b000
+  @proto_binary 0b001
   @proto_lsu 0b010
-  @proto_msg 0b011
-  @proto_util 0b100
+  @proto_util 0b011
 
   # LSU types (3 bits)
   @lsu_type_req 0b000
   @lsu_type_conf 0b001
   @lsu_type_term 0b010
   @lsu_type_status 0b011
+
+  # Utility PDU types (3 bits)
+  @util_type_tod 0b000
 
   # CRC polynomial: x^16 + x^12 + x^8 + x^7 + x^4 + x^3 + x + 1
   # Represented as 0x9299 (bit-reversed form used in spec)
@@ -193,11 +197,9 @@ defmodule Minutewave.ALE.PDU do
     Carries short text messages during or after linking.
     """
 
-    defstruct [
-      control: 0,
-      countdown: 0,
-      text: <<>>
-    ]
+    defstruct control: 0,
+              countdown: 0,
+              text: <<>>
 
     @type t :: %__MODULE__{
             control: non_neg_integer(),
@@ -217,11 +219,9 @@ defmodule Minutewave.ALE.PDU do
     Carries binary data.
     """
 
-    defstruct [
-      control: 0,
-      countdown: 0,
-      data: <<>>
-    ]
+    defstruct control: 0,
+              countdown: 0,
+              data: <<>>
 
     @type t :: %__MODULE__{
             control: non_neg_integer(),
@@ -363,7 +363,7 @@ defmodule Minutewave.ALE.PDU do
 
     payload =
       <<
-        @proto_msg::3,
+        @proto_text::3,
         pdu.control::5,
         pdu.countdown::8,
         text_bytes::binary-size(8)
@@ -379,10 +379,38 @@ defmodule Minutewave.ALE.PDU do
 
     payload =
       <<
-        @proto_msg::3,
+        @proto_binary::3,
         pdu.control::5,
         pdu.countdown::8,
         data_bytes::binary-size(8)
+      >>
+
+    append_crc(payload)
+  end
+
+  def encode(%TodResponse{} = pdu) do
+    payload =
+      <<
+        # Byte 0: proto(3)=util + util_type(3)=tod + v(1) + m(1)
+        @proto_util::3,
+        @util_type_tod::3,
+        bool_to_bit(pdu.voice)::1,
+        bool_to_bit(pdu.more)::1,
+        # Byte 1: ec(2) + sync_sign(2) + sync_tq(3) + reserved(1)
+        pdu.equipment_class::2,
+        pdu.sync_sign::2,
+        pdu.sync_tq::3,
+        0::1,
+        # Bytes 2-3: caller_addr (the station that asked for TOD)
+        pdu.caller_addr::little-16,
+        # Bytes 4-5: responder_addr (us, serving the time)
+        pdu.responder_addr::little-16,
+        # Bytes 6-7: sync_mag (fine offset / uncertainty magnitude, ms)
+        pdu.sync_mag::little-16,
+        # Byte 8: coarse_min
+        pdu.coarse_min::8,
+        # Byte 9: coarse_sec
+        pdu.coarse_sec::8
       >>
 
     append_crc(payload)
@@ -475,7 +503,7 @@ defmodule Minutewave.ALE.PDU do
      }}
   end
 
-  defp decode_payload(<<@proto_msg::3, control::5, countdown::8, text::binary-size(8)>>) do
+  defp decode_payload(<<@proto_text::3, control::5, countdown::8, text::binary-size(8)>>) do
     # Trim null bytes from text
     text_trimmed = String.trim_trailing(text, <<0>>)
 
@@ -484,6 +512,15 @@ defmodule Minutewave.ALE.PDU do
        control: control,
        countdown: countdown,
        text: text_trimmed
+     }}
+  end
+
+  defp decode_payload(<<@proto_binary::3, control::5, countdown::8, data::binary-size(8)>>) do
+    {:ok,
+     %BinMessage{
+       control: control,
+       countdown: countdown,
+       data: data
      }}
   end
 
@@ -507,6 +544,34 @@ defmodule Minutewave.ALE.PDU do
        caller_addr: caller,
        count: count,
        assigned_subchannels: assigned
+     }}
+  end
+
+  defp decode_payload(<<@proto_util::3, @util_type_tod::3, v::1, m::1, rest::binary>>) do
+    <<
+      ec::2,
+      sync_sign::2,
+      sync_tq::3,
+      _reserved::1,
+      caller::little-16,
+      responder::little-16,
+      sync_mag::little-16,
+      coarse_min::8,
+      coarse_sec::8
+    >> = rest
+
+    {:ok,
+     %TodResponse{
+       voice: bit_to_bool(v),
+       more: bit_to_bool(m),
+       equipment_class: ec,
+       sync_sign: sync_sign,
+       sync_tq: sync_tq,
+       sync_mag: sync_mag,
+       caller_addr: caller,
+       responder_addr: responder,
+       coarse_min: coarse_min,
+       coarse_sec: coarse_sec
      }}
   end
 

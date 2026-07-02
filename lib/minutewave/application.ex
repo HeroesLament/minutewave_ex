@@ -6,6 +6,11 @@ defmodule Minutewave.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      # Disciplined virtual clock for synchronous ALE scan timing.
+      # GNSS-disciplined by default; peer TOD sync is opt-in via
+      # Minutewave.Clock.set_tod_admissible/1.
+      Minutewave.Clock,
+
       # Per-rig event buses and FSM processes register themselves under
       # this registry, addressed by {rig_id, role}.
       {Registry, keys: :unique, name: Minutewave.Modem.Registry},

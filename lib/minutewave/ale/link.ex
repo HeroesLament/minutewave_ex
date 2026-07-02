@@ -280,7 +280,9 @@ defmodule Minutewave.ALE.Link do
   def idle(:enter, _old_state, data) do
     Logger.debug("ALE Link [#{data.rig_id}] entering IDLE")
     broadcast_state_change(data.rig_id, :idle, nil)
-    {:keep_state, %{data | remote_addr: nil, link_info: nil}}
+    data = %{data | remote_addr: nil, link_info: nil}
+    publish_state(:idle, data)
+    {:keep_state, data}
   end
 
   def idle({:call, from}, {:scan, opts}, data) do
@@ -478,6 +480,7 @@ defmodule Minutewave.ALE.Link do
 
   def scanning(:enter, _old_state, data) do
     Logger.info("ALE Link [#{data.rig_id}] entering SCANNING")
+    publish_state(:scanning, data)
 
     dwell_ms = data.timing.scan_dwell_ms
     n_channels = length(data.channels)
@@ -655,6 +658,7 @@ defmodule Minutewave.ALE.Link do
         # Use address-based stagger: offset = (self_addr * 137 mod dwell) clamped
         # to first half of dwell, so TX completes before dwell ends.
         updated_data = maybe_schedule_sounding(updated_data, remaining_dwell)
+        publish_state(:scanning, updated_data)
 
         {:keep_state, updated_data, [{:state_timeout, remaining_dwell, :dwell_timeout}]}
     end
@@ -1166,6 +1170,7 @@ defmodule Minutewave.ALE.Link do
 
   def calling(:enter, _old_state, data) do
     Logger.debug("ALE Link [#{data.rig_id}] entering CALLING")
+    publish_state(:calling, data)
 
     broadcast_state_change(data.rig_id, :calling, %{
       remote_addr: data.remote_addr,
@@ -1568,6 +1573,7 @@ defmodule Minutewave.ALE.Link do
     )
 
     broadcast_state_change(data.rig_id, :linked, data.link_info)
+    publish_state(:linked, data)
 
     # Auto-terminate LQA exchange links (G.5.5.10.2)
     # If we initiated an LQA exchange, terminate immediately after link is established.
@@ -1778,6 +1784,26 @@ defmodule Minutewave.ALE.Link do
   # "holdover-in-specification"): lockstep alignment is still valid.
   # :unsynced means accumulated uncertainty has exceeded the guard band —
   # degrade to async / shared pool.
+  # Publish the viewable state projection to Minutewave.RigState so the UI,
+  # dashboard, and ACS can observe this rig without querying the FSM. This is a
+  # one-way mirror: the FSM's `data` remains the source of truth. Keyed by
+  # rig_id (one entry per rig; MinuteModem runs several at once).
+  defp publish_state(link_state, data) do
+    channel = Enum.at(data.channels || [], data.scan_index || 0)
+
+    Minutewave.RigState.publish(data.rig_id, %{
+      link_state: link_state,
+      channels: data.channels,
+      scan_index: data.scan_index,
+      current_freq_hz: data.current_freq_hz || (channel && channel_freq(channel)),
+      scan_mode: data.scan_mode,
+      clock_sync_ok: data.clock_sync_ok,
+      remote_addr: data.remote_addr
+    })
+
+    data
+  end
+
   defp clock_permits_sync?() do
     case Minutewave.Clock.quality() do
       {:unsynced, _} -> false

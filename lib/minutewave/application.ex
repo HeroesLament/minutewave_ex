@@ -11,6 +11,10 @@ defmodule Minutewave.Application do
       # Minutewave.Clock.set_tod_admissible/1.
       Minutewave.Clock,
 
+      # Read-only ETS projection of per-rig ALE runtime state (channels, current
+      # freq, scan mode, link state) for UI/dashboard/ACS observation.
+      Minutewave.RigState,
+
       # Per-rig event buses and FSM processes register themselves under
       # this registry, addressed by {rig_id, role}.
       {Registry, keys: :unique, name: Minutewave.Modem.Registry},

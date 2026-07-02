@@ -194,6 +194,19 @@ defmodule Minutewave.ALE.Link do
   end
 
   @doc """
+  Like `rx_pdu/2`, but also reports the SNR (already encoded per MIL-STD-188-141D
+  G.5.5.1.6: measured dB + 10, clamped 0..63) measured during reception of this
+  frame. Casts are FIFO-ordered between two processes, so the SNR is stashed
+  before the PDU is handled; a responder reads it when building its LSU_Conf so
+  the two-way LQA exchange (G.5.5.10.2) reports a real SNR rather than 0.
+  """
+  def rx_pdu(rig_id, pdu, rx_snr) when is_integer(rx_snr) do
+    via = via(rig_id)
+    GenStateMachine.cast(via, {:rx_snr, rx_snr})
+    GenStateMachine.cast(via, {:rx_pdu, pdu})
+  end
+
+  @doc """
   Notify that LBT/LBR sensing is complete.
   """
   def channel_sense_complete(rig_id, result) when result in [:clear, :busy] do
@@ -248,6 +261,7 @@ defmodule Minutewave.ALE.Link do
         tod_req_end_mono: nil,
         # If true, auto-request TOD when clock degrades to :unsynced (G.5.7.4)
         tod_request_enabled: false,
+        last_rx_snr: nil,
         current_freq_hz: nil,
         # Calling state — synchronous call scheduling
         call_freq_hz: nil,
@@ -448,7 +462,7 @@ defmodule Minutewave.ALE.Link do
             traffic_type: pdu.traffic_type,
             assigned_subchannels: pdu.assigned_subchannels,
             occupied_subchannels: pdu.occupied_subchannels,
-            rx_snr: nil
+            rx_snr: data.last_rx_snr
           }
       }
 
@@ -463,6 +477,7 @@ defmodule Minutewave.ALE.Link do
     end
   end
 
+  def idle(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def idle(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def idle(:cast, :signal_onset, _data), do: :keep_state_and_data
   def idle(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -838,7 +853,7 @@ defmodule Minutewave.ALE.Link do
             traffic_type: pdu.traffic_type,
             assigned_subchannels: pdu.assigned_subchannels,
             occupied_subchannels: pdu.occupied_subchannels,
-            rx_snr: nil,
+            rx_snr: data.last_rx_snr,
             freq_hz: data.current_freq_hz
           }
       }
@@ -849,6 +864,7 @@ defmodule Minutewave.ALE.Link do
     end
   end
 
+  def scanning(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def scanning(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
 
   def scanning({:call, from}, {:sound, opts}, data) do
@@ -1090,7 +1106,7 @@ defmodule Minutewave.ALE.Link do
             traffic_type: pdu.traffic_type,
             assigned_subchannels: pdu.assigned_subchannels,
             occupied_subchannels: pdu.occupied_subchannels,
-            rx_snr: nil,
+            rx_snr: data.last_rx_snr,
             freq_hz: data.current_freq_hz
           }
       }
@@ -1101,6 +1117,7 @@ defmodule Minutewave.ALE.Link do
     end
   end
 
+  def sounding(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def sounding(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def sounding(:cast, :signal_onset, _data), do: :keep_state_and_data
   def sounding(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -1159,6 +1176,7 @@ defmodule Minutewave.ALE.Link do
   end
 
   # Absorb PDUs during LBT (we're about to TX)
+  def lbt(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def lbt(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def lbt(:cast, :signal_onset, _data), do: :keep_state_and_data
   def lbt(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -1319,6 +1337,12 @@ defmodule Minutewave.ALE.Link do
         "ALE Link [#{data.rig_id}] received confirm from 0x#{Integer.to_string(data.remote_addr, 16)}"
       )
 
+      # TX-direction LQA (G.5.5.10.2): the confirm's SNR field is the peer's
+      # report of how well THEY heard US. Decode from the wire encoding
+      # (G.5.5.1.6: field = dB + 10) and record it as a :tx observation, so the
+      # store holds both how-we-hear-them (:rx) and how-they-hear-us (:tx).
+      record_tx_snr(data, pdu.snr)
+
       link_info = %{
         caller_addr: data.self_addr,
         called_addr: data.remote_addr,
@@ -1363,6 +1387,7 @@ defmodule Minutewave.ALE.Link do
     {:next_state, :idle, data}
   end
 
+  def calling(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def calling(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def calling(:cast, :signal_onset, _data), do: :keep_state_and_data
   def calling(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -1403,6 +1428,7 @@ defmodule Minutewave.ALE.Link do
     {:next_state, :idle, data}
   end
 
+  def lbr(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def lbr(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def lbr(:cast, :signal_onset, _data), do: :keep_state_and_data
   def lbr(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -1465,6 +1491,7 @@ defmodule Minutewave.ALE.Link do
     {:next_state, :scanning, %{data | tod_info: nil}}
   end
 
+  def tod_responding(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def tod_responding(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def tod_responding(:cast, :signal_onset, _data), do: :keep_state_and_data
   def tod_responding(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -1556,6 +1583,7 @@ defmodule Minutewave.ALE.Link do
     {:next_state, :idle, data}
   end
 
+  def responding(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def responding(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def responding(:cast, :signal_onset, _data), do: :keep_state_and_data
   def responding(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -1645,6 +1673,7 @@ defmodule Minutewave.ALE.Link do
     {:keep_state_and_data, [{:reply, from, {:error, :already_linked}}]}
   end
 
+  def linked(:cast, {:rx_snr, snr}, data), do: {:keep_state, %{data | last_rx_snr: snr}}
   def linked(:cast, {:rx_pdu, _pdu}, _data), do: :keep_state_and_data
   def linked(:cast, :signal_onset, _data), do: :keep_state_and_data
   def linked(:cast, :signal_offset, _data), do: :keep_state_and_data
@@ -1788,6 +1817,33 @@ defmodule Minutewave.ALE.Link do
   # dashboard, and ACS can observe this rig without querying the FSM. This is a
   # one-way mirror: the FSM's `data` remains the source of truth. Keyed by
   # rig_id (one entry per rig; MinuteModem runs several at once).
+  # Record the peer's reported SNR (from an LsuConf) as a :tx-direction LQA
+  # observation. `wire_snr` is the G.5.5.1.6-encoded field; decode to dB. The
+  # metrics map carries only the SNR (we did not decode our own transmission),
+  # so the LQA score for a :tx observation is derived from SNR alone.
+  defp record_tx_snr(data, wire_snr) when is_integer(wire_snr) do
+    snr_db = wire_snr - 10
+
+    try do
+      Minutewave.ALE.LQA.record_observation(
+        data.rig_id,
+        data.remote_addr,
+        data.call_freq_hz,
+        %{snr_db: snr_db},
+        direction: :tx,
+        frame_type: "response",
+        snr_db: snr_db,
+        lqa_score: Minutewave.ALE.LQA.snr_score(snr_db)
+      )
+    rescue
+      e -> Logger.warning("ALE Link [#{data.rig_id}] TX LQA record failed: #{inspect(e)}")
+    end
+
+    :ok
+  end
+
+  defp record_tx_snr(_data, _), do: :ok
+
   defp publish_state(link_state, data) do
     channel = Enum.at(data.channels || [], data.scan_index || 0)
 

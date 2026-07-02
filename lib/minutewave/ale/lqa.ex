@@ -62,6 +62,19 @@ defmodule Minutewave.ALE.LQA do
     Float.round(probe + viterbi + llr, 1)
   end
 
+  @doc """
+  Map an SNR in dB to a 0..100 link-quality score comparable to `score/1`, for
+  scoring :tx observations (where only the peer's reported SNR is available).
+  -10 dB or worse -> 0 (unusable); +30 dB or better -> 100. Linear between.
+  """
+  @spec snr_score(number() | nil) :: float()
+  def snr_score(nil), do: 0.0
+
+  def snr_score(snr_db) when is_number(snr_db) do
+    clamped = max(-10.0, min(30.0, snr_db))
+    Float.round((clamped + 10.0) / 40.0 * 100.0, 1)
+  end
+
   defp score_probe(corr) when is_number(corr) do
     clamped = max(0.0, min(100.0, corr))
     if clamped < 40.0, do: 0.0, else: (clamped - 40.0) / 50.0 * 30.0
@@ -96,28 +109,36 @@ defmodule Minutewave.ALE.LQA do
     * `opts` - `:frame_type` (default `"call"`), `:net_id`, `:snr_db`
   """
   def record_observation(rig_id, source_addr, freq_hz, metrics, opts \\ []) do
-    lqa_score = score(metrics)
+    # A :tx observation carries no decode metrics (the peer decoded us), so its
+    # score must come from the reported SNR, not the probe/Viterbi/LLR formula.
+    # Callers may pass :lqa_score to override; otherwise derive from metrics.
+    lqa_score = Keyword.get_lazy(opts, :lqa_score, fn -> score(metrics) end)
 
-    Events.broadcast(rig_id, {:ale, {:lqa_observation, %{
-      rig_id: rig_id,
-      source_addr: source_addr,
-      freq_hz: freq_hz,
-      lqa_score: lqa_score,
-      direction: :rx,
-      frame_type: Keyword.get(opts, :frame_type, "call"),
-      net_id: Keyword.get(opts, :net_id),
-      snr_db: Keyword.get(opts, :snr_db),
-      metrics: %{
-        probe_corr: Map.get(metrics, :probe_corr),
-        path_metric_delta: Map.get(metrics, :path_metric_delta),
-        path_metric: Map.get(metrics, :path_metric),
-        avg_llr: Map.get(metrics, :avg_llr),
-        min_llr: Map.get(metrics, :min_llr),
-        preamble_zeros: Map.get(metrics, :preamble_zeros),
-        waveform: Map.get(metrics, :waveform) |> to_string_or_nil(),
-        decode_path: Map.get(metrics, :decode_path) |> to_string_or_nil()
-      }
-    }}})
+    Events.broadcast(
+      rig_id,
+      {:ale,
+       {:lqa_observation,
+        %{
+          rig_id: rig_id,
+          source_addr: source_addr,
+          freq_hz: freq_hz,
+          lqa_score: lqa_score,
+          direction: Keyword.get(opts, :direction, :rx),
+          frame_type: Keyword.get(opts, :frame_type, "call"),
+          net_id: Keyword.get(opts, :net_id),
+          snr_db: Keyword.get(opts, :snr_db),
+          metrics: %{
+            probe_corr: Map.get(metrics, :probe_corr),
+            path_metric_delta: Map.get(metrics, :path_metric_delta),
+            path_metric: Map.get(metrics, :path_metric),
+            avg_llr: Map.get(metrics, :avg_llr),
+            min_llr: Map.get(metrics, :min_llr),
+            preamble_zeros: Map.get(metrics, :preamble_zeros),
+            waveform: Map.get(metrics, :waveform) |> to_string_or_nil(),
+            decode_path: Map.get(metrics, :decode_path) |> to_string_or_nil()
+          }
+        }}}
+    )
 
     lqa_score
   end
@@ -197,10 +218,13 @@ defmodule Minutewave.ALE.LQA do
 
     freq_list
     |> Enum.map(fn freq -> %{freq_hz: freq, last_heard: Map.get(recent, freq)} end)
-    |> Enum.sort_by(fn
-      %{last_heard: nil} -> DateTime.from_unix!(0)
-      %{last_heard: ts} -> ts
-    end, DateTime)
+    |> Enum.sort_by(
+      fn
+        %{last_heard: nil} -> DateTime.from_unix!(0)
+        %{last_heard: ts} -> ts
+      end,
+      DateTime
+    )
     |> List.first()
   end
 

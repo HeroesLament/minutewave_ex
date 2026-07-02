@@ -55,16 +55,21 @@ defmodule Minutewave.ALE.Receiver do
   alias Minutewave.Rig.Control
 
   @sample_rate 9600
-  @samples_per_symbol 4  # 9600 / 2400 = 4
+  # 9600 / 2400 = 4
+  @samples_per_symbol 4
   @full_probe_length 96
 
   # Deep WALE frame structure
-  @deep_preamble_symbols 576   # 18 Walsh blocks × 32 symbols
-  @deep_data_symbols 6144      # 96 quadbits × 64 symbols (Walsh-16)
+  # 18 Walsh blocks × 32 symbols
+  @deep_preamble_symbols 576
+  # 96 quadbits × 64 symbols (Walsh-16)
+  @deep_data_symbols 6144
 
   # Fast WALE frame structure
-  @fast_preamble_symbols 288   # 9 Walsh blocks × 32 symbols
-  @fast_initial_probe 32       # Known probe before data
+  # 9 Walsh blocks × 32 symbols
+  @fast_preamble_symbols 288
+  # Known probe before data
+  @fast_initial_probe 32
 
   # -------------------------------------------------------------------
   # Signal detection parameters
@@ -174,10 +179,12 @@ defmodule Minutewave.ALE.Receiver do
     case Audio.subscribe(state.rig_id) do
       :ok ->
         Logger.debug("ALE Receiver [#{state.rig_id}] subscribed to Rig.Audio")
+
       {:error, reason} ->
         Logger.warning("ALE Receiver [#{state.rig_id}] failed to subscribe: #{inspect(reason)}")
         Process.send_after(self(), :retry_subscribe, 500)
     end
+
     {:noreply, state}
   end
 
@@ -186,9 +193,11 @@ defmodule Minutewave.ALE.Receiver do
     case Audio.subscribe(state.rig_id) do
       :ok ->
         Logger.debug("ALE Receiver [#{state.rig_id}] subscribed to Rig.Audio (retry)")
+
       {:error, _} ->
         Process.send_after(self(), :retry_subscribe, 500)
     end
+
     {:noreply, state}
   end
 
@@ -257,12 +266,13 @@ defmodule Minutewave.ALE.Receiver do
     samples = apply_agc(samples)
     symbols = PhyModem.unified_demod_symbols(state.demod, samples)
 
-    state = %{state |
-      rx_state: :idle,
-      symbol_buffer: [],
-      sample_buffer: [],
-      rx_sample_count: 0,
-      quiet_chunks: 0
+    state = %{
+      state
+      | rx_state: :idle,
+        symbol_buffer: [],
+        sample_buffer: [],
+        rx_sample_count: 0,
+        quiet_chunks: 0
     }
 
     process_complete_frame(symbols, samples, state)
@@ -278,7 +288,10 @@ defmodule Minutewave.ALE.Receiver do
     if signal_present do
       # === Signal onset detected ===
       threshold = effective_threshold(state)
-      Logger.info("[ALE RX #{short(state.rig_id)}] Signal onset: RMS=#{round(rms)} threshold=#{round(threshold)} noise_floor=#{round(state.noise_floor_rms)}")
+
+      Logger.info(
+        "[ALE RX #{short(state.rig_id)}] Signal onset: RMS=#{round(rms)} threshold=#{round(threshold)} noise_floor=#{round(state.noise_floor_rms)}"
+      )
 
       :telemetry.execute(
         [:minutemodem, :ale, :signal_onset],
@@ -294,12 +307,13 @@ defmodule Minutewave.ALE.Receiver do
       samples = apply_agc(samples)
       symbols = PhyModem.unified_demod_symbols(state.demod, samples)
 
-      %{state |
-        rx_state: :receiving,
-        symbol_buffer: symbols,
-        sample_buffer: samples,
-        rx_sample_count: length(samples),
-        quiet_chunks: 0
+      %{
+        state
+        | rx_state: :receiving,
+          symbol_buffer: symbols,
+          sample_buffer: samples,
+          rx_sample_count: length(samples),
+          quiet_chunks: 0
       }
     else
       # Update noise floor estimate (exponential moving average)
@@ -321,71 +335,87 @@ defmodule Minutewave.ALE.Receiver do
     new_buffer = state.symbol_buffer ++ symbols
     new_sample_buffer = state.sample_buffer ++ samples
 
-    new_state = cond do
-      signal_present ->
-        %{state |
-          symbol_buffer: new_buffer,
-          sample_buffer: new_sample_buffer,
-          rx_sample_count: new_sample_count,
-          quiet_chunks: 0
-        }
-
-      # Case 2: Signal dropped — increment quiet counter
-      # We still demodulate these quiet chunks because the tail end of
-      # the modulated signal may straddle the energy boundary
-      state.quiet_chunks + 1 < @quiet_chunks_for_eot ->
-        %{state |
-          symbol_buffer: new_buffer,
-          sample_buffer: new_sample_buffer,
-          rx_sample_count: new_sample_count,
-          quiet_chunks: state.quiet_chunks + 1
-        }
-
-      true ->
-        Logger.info("[ALE RX #{short(state.rig_id)}] End of transmission: #{new_sample_count} samples, #{length(new_buffer)} symbols")
-
-        :telemetry.execute(
-          [:minutemodem, :ale, :signal_offset],
+    new_state =
+      cond do
+        signal_present ->
           %{
-            sample_count: new_sample_count,
-            symbol_count: length(new_buffer),
-            duration_ms: new_sample_count / state.sample_rate * 1000.0
-          },
-          %{rig_id: state.rig_id}
-        )
+            state
+            | symbol_buffer: new_buffer,
+              sample_buffer: new_sample_buffer,
+              rx_sample_count: new_sample_count,
+              quiet_chunks: 0
+          }
 
-        # Notify the Link FSM that the signal has ended so scanning can resume
-        Link.signal_offset(state.rig_id)
+        # Case 2: Signal dropped — increment quiet counter
+        # We still demodulate these quiet chunks because the tail end of
+        # the modulated signal may straddle the energy boundary
+        state.quiet_chunks + 1 < @quiet_chunks_for_eot ->
+          %{
+            state
+            | symbol_buffer: new_buffer,
+              sample_buffer: new_sample_buffer,
+              rx_sample_count: new_sample_count,
+              quiet_chunks: state.quiet_chunks + 1
+          }
 
-        reset_state = %{state |
-          rx_state: :idle,
-          symbol_buffer: [],
-          sample_buffer: [],
-          rx_sample_count: 0,
-          quiet_chunks: 0
-        }
+        true ->
+          Logger.info(
+            "[ALE RX #{short(state.rig_id)}] End of transmission: #{new_sample_count} samples, #{length(new_buffer)} symbols"
+          )
 
-        if length(new_buffer) >= @min_symbols_for_decode do
-          process_complete_frame(new_buffer, new_sample_buffer, reset_state)
-        else
-          Logger.debug("[ALE RX #{short(state.rig_id)}] Too few symbols (#{length(new_buffer)}), discarding")
-          reset_state
-        end
-    end
+          :telemetry.execute(
+            [:minutemodem, :ale, :signal_offset],
+            %{
+              sample_count: new_sample_count,
+              symbol_count: length(new_buffer),
+              duration_ms: new_sample_count / state.sample_rate * 1000.0
+            },
+            %{rig_id: state.rig_id}
+          )
+
+          # Notify the Link FSM that the signal has ended so scanning can resume
+          Link.signal_offset(state.rig_id)
+
+          reset_state = %{
+            state
+            | rx_state: :idle,
+              symbol_buffer: [],
+              sample_buffer: [],
+              rx_sample_count: 0,
+              quiet_chunks: 0
+          }
+
+          if length(new_buffer) >= @min_symbols_for_decode do
+            process_complete_frame(new_buffer, new_sample_buffer, reset_state)
+          else
+            Logger.debug(
+              "[ALE RX #{short(state.rig_id)}] Too few symbols (#{length(new_buffer)}), discarding"
+            )
+
+            reset_state
+          end
+      end
 
     maybe_force_process(new_state, new_buffer, new_sample_buffer)
   end
 
-  defp maybe_force_process(%{rx_state: :receiving, rx_sample_count: count} = state, buffer, sample_buffer)
+  defp maybe_force_process(
+         %{rx_state: :receiving, rx_sample_count: count} = state,
+         buffer,
+         sample_buffer
+       )
        when count >= @max_tx_samples do
-    Logger.warning("[ALE RX #{short(state.rig_id)}] Max TX duration reached (#{count} samples), forcing decode")
+    Logger.warning(
+      "[ALE RX #{short(state.rig_id)}] Max TX duration reached (#{count} samples), forcing decode"
+    )
 
-    reset_state = %{state |
-      rx_state: :idle,
-      symbol_buffer: [],
-      sample_buffer: [],
-      rx_sample_count: 0,
-      quiet_chunks: 0
+    reset_state = %{
+      state
+      | rx_state: :idle,
+        symbol_buffer: [],
+        sample_buffer: [],
+        rx_sample_count: 0,
+        quiet_chunks: 0
     }
 
     if length(buffer) >= @min_symbols_for_decode do
@@ -420,6 +450,37 @@ defmodule Minutewave.ALE.Receiver do
     :math.sqrt(sum_sq / n)
   end
 
+  # SNR in dB from a frame's sample RMS over the running noise-floor RMS.
+  # Returns nil when it can't be computed (no samples / degenerate floor), so
+  # callers treat SNR as unknown rather than fabricating a value.
+  defp frame_snr_db([], _noise_floor), do: nil
+
+  defp frame_snr_db(_samples, noise_floor) when not is_number(noise_floor) or noise_floor <= 0.0,
+    do: nil
+
+  defp frame_snr_db(samples, noise_floor) do
+    sig = compute_rms(samples)
+
+    if sig <= 0.0 do
+      nil
+    else
+      20.0 * :math.log10(sig / noise_floor)
+    end
+  end
+
+  # Encode a dB SNR to the on-air field (G.5.5.1.6): value = round(dB) + 10,
+  # clamped to 0..63. -10 dB or worse -> 0; +53 dB or better -> 63. Unknown SNR
+  # (nil) encodes as 0, the field's floor.
+  defp encode_snr_field(nil), do: 0
+
+  defp encode_snr_field(snr_db) do
+    snr_db
+    |> Kernel.+(10.0)
+    |> round()
+    |> max(0)
+    |> min(63)
+  end
+
   # -------------------------------------------------------------------
   # AGC
   # -------------------------------------------------------------------
@@ -447,18 +508,33 @@ defmodule Minutewave.ALE.Receiver do
 
   defp process_complete_frame(symbols, raw_samples, state) do
     first_32 = Enum.take(symbols, 32)
-    Logger.info("[ALE RX #{short(state.rig_id)}] Attempting frame decode: #{length(symbols)} symbols, #{length(raw_samples)} samples, first 32: #{inspect(first_32)}")
+
+    Logger.info(
+      "[ALE RX #{short(state.rig_id)}] Attempting frame decode: #{length(symbols)} symbols, #{length(raw_samples)} samples, first 32: #{inspect(first_32)}"
+    )
+
     {_remaining, decoded_results, _state} = find_frames(symbols, raw_samples, state)
 
     if decoded_results == [] do
-      Logger.info("[ALE RX #{short(state.rig_id)}] No PDUs decoded from #{length(symbols)} symbols")
+      Logger.info(
+        "[ALE RX #{short(state.rig_id)}] No PDUs decoded from #{length(symbols)} symbols"
+      )
     end
 
+    # Frame SNR from the captured samples vs. the running noise floor. This is
+    # the RX-direction link quality: how well WE heard this frame. `snr_db` is
+    # the raw dB value stored in the LQA observation; `snr_field` is the on-air
+    # encoding per MIL-STD-188-141D G.5.5.1.6 (measured dB + 10, clamped 0..63)
+    # that a responder puts in its LSU_Conf for the two-way exchange (G.5.5.10.2).
+    snr_db = frame_snr_db(raw_samples, state.noise_floor_rms)
+    snr_field = encode_snr_field(snr_db)
+
     # Get current frequency from rig control for LQA recording
-    freq_hz = case safe_get_frequency(state.rig_id) do
-      {:ok, freq} -> freq
-      _ -> nil
-    end
+    freq_hz =
+      case safe_get_frequency(state.rig_id) do
+        {:ok, freq} -> freq
+        _ -> nil
+      end
 
     Enum.each(decoded_results, fn {pdu, metrics} ->
       Logger.info("ALE RX [#{state.rig_id}] decoded PDU: #{inspect(pdu)}")
@@ -466,22 +542,30 @@ defmodule Minutewave.ALE.Receiver do
       :telemetry.execute(
         [:minutemodem, :ale, :pdu],
         %{symbol_count: length(symbols)},
-        %{rig_id: state.rig_id, pdu_type: pdu_type_name(pdu), waveform: detect_waveform_from_symbols(symbols)}
+        %{
+          rig_id: state.rig_id,
+          pdu_type: pdu_type_name(pdu),
+          waveform: detect_waveform_from_symbols(symbols)
+        }
       )
 
       # Record LQA observation if we know the source address and frequency
       source_addr = LQA.source_addr(pdu)
+
       if source_addr && freq_hz do
         lqa_metrics = Map.merge(metrics, %{waveform: detect_waveform_from_symbols(symbols)})
+
         try do
           LQA.record_observation(state.rig_id, source_addr, freq_hz, lqa_metrics,
-            frame_type: LQA.frame_type(pdu))
+            frame_type: LQA.frame_type(pdu),
+            snr_db: snr_db
+          )
         rescue
           e -> Logger.warning("[ALE RX] LQA record failed: #{inspect(e)}")
         end
       end
 
-      Link.rx_pdu(state.rig_id, pdu)
+      Link.rx_pdu(state.rig_id, pdu, snr_field)
     end)
 
     state
@@ -496,34 +580,40 @@ defmodule Minutewave.ALE.Receiver do
   defp find_frames(symbols, raw_samples, state) do
     case find_capture_probe(symbols) do
       {:found, offset, _rest, phase_info} ->
-        Logger.info("[ALE RX] Found capture probe at offset #{offset}, corr=#{phase_info.correlation}")
+        Logger.info(
+          "[ALE RX] Found capture probe at offset #{offset}, corr=#{phase_info.correlation}"
+        )
 
         frame_start = offset + @full_probe_length
         frame_symbols = Enum.drop(symbols, frame_start)
 
-        phase_scores = Enum.map(0..7, fn phase ->
-          corrected = Enum.map(frame_symbols, fn s -> rem(s - phase + 8, 8) end)
-          first_block = Enum.take(corrected, 32)
+        phase_scores =
+          Enum.map(0..7, fn phase ->
+            corrected = Enum.map(frame_symbols, fn s -> rem(s - phase + 8, 8) end)
+            first_block = Enum.take(corrected, 32)
 
-          case Walsh.descramble_preamble(first_block) do
-            {:error, _} ->
-              {phase, 0, -1000}
+            case Walsh.descramble_preamble(first_block) do
+              {:error, _} ->
+                {phase, 0, -1000}
 
-            descrambled ->
-              zeros = Enum.count(descrambled, &(&1 == 0))
+              descrambled ->
+                zeros = Enum.count(descrambled, &(&1 == 0))
 
-              waveform_score = case Waveform.detect_waveform(corrected) do
-                {:ok, _, %{correlation_score: score}} -> score
-                _ -> -1000
-              end
+                waveform_score =
+                  case Waveform.detect_waveform(corrected) do
+                    {:ok, _, %{correlation_score: score}} -> score
+                    _ -> -1000
+                  end
 
-              {phase, zeros, waveform_score}
-          end
-        end)
+                {phase, zeros, waveform_score}
+            end
+          end)
 
         {best_phase, best_zeros, best_wf} = Enum.max_by(phase_scores, fn {_p, z, w} -> {z, w} end)
 
-        Logger.info("[ALE RX] Best phase: #{best_phase} (#{best_phase * 45}°), zeros=#{best_zeros}, wf_score=#{best_wf}")
+        Logger.info(
+          "[ALE RX] Best phase: #{best_phase} (#{best_phase * 45}°), zeros=#{best_zeros}, wf_score=#{best_wf}"
+        )
 
         :telemetry.execute(
           [:minutemodem, :ale, :probe],
@@ -534,12 +624,18 @@ defmodule Minutewave.ALE.Receiver do
             preamble_zeros: best_zeros,
             waveform_score: best_wf
           },
-          %{rig_id: state.rig_id, result: :found, peak_corr: abs(phase_info.correlation), peak_offset: offset}
+          %{
+            rig_id: state.rig_id,
+            result: :found,
+            peak_corr: abs(phase_info.correlation),
+            peak_offset: offset
+          }
         )
 
-        corrected = Enum.map(frame_symbols, fn s ->
-          rem(s - best_phase + 8, 8)
-        end)
+        corrected =
+          Enum.map(frame_symbols, fn s ->
+            rem(s - best_phase + 8, 8)
+          end)
 
         sample_offset = frame_start * @samples_per_symbol
         frame_samples = Enum.drop(raw_samples, sample_offset)
@@ -547,17 +643,24 @@ defmodule Minutewave.ALE.Receiver do
         case decode_frame(corrected, frame_samples, state.rig_id) do
           {:ok, pdu, remaining, decode_metrics} ->
             # Merge probe-level metrics with decode-level metrics for LQA
-            combined_metrics = Map.merge(decode_metrics, %{
-              probe_corr: abs(phase_info.correlation),
-              preamble_zeros: best_zeros
-            })
+            combined_metrics =
+              Map.merge(decode_metrics, %{
+                probe_corr: abs(phase_info.correlation),
+                preamble_zeros: best_zeros
+              })
 
             remaining_samples = Enum.drop(frame_samples, length(corrected) * @samples_per_symbol)
-            {final_remaining, more_results, final_state} = find_frames(remaining, remaining_samples, state)
+
+            {final_remaining, more_results, final_state} =
+              find_frames(remaining, remaining_samples, state)
+
             {final_remaining, [{pdu, combined_metrics} | more_results], final_state}
 
           :incomplete ->
-            Logger.info("[ALE RX] Frame incomplete: only #{length(corrected)} symbols after probe")
+            Logger.info(
+              "[ALE RX] Frame incomplete: only #{length(corrected)} symbols after probe"
+            )
+
             {[], [], state}
 
           :error ->
@@ -567,11 +670,13 @@ defmodule Minutewave.ALE.Receiver do
 
       :not_found ->
         Logger.info("[ALE RX] No capture probe found in #{length(symbols)} symbols")
+
         :telemetry.execute(
           [:minutemodem, :ale, :probe],
           %{correlation: 0, offset: 0, phase_deg: 0, preamble_zeros: 0, waveform_score: 0},
           %{rig_id: state.rig_id, result: :not_found, peak_corr: 0, peak_offset: 0}
         )
+
         {symbols, [], state}
     end
   end
@@ -590,8 +695,12 @@ defmodule Minutewave.ALE.Receiver do
 
     case best_result do
       :not_found ->
-        Logger.info("[ALE RX] Probe search failed: peak |corr|=#{peak_corr} at offset #{peak_offset} (threshold=20)")
+        Logger.info(
+          "[ALE RX] Probe search failed: peak |corr|=#{peak_corr} at offset #{peak_offset} (threshold=20)"
+        )
+
         :not_found
+
       found ->
         found
     end
@@ -606,15 +715,16 @@ defmodule Minutewave.ALE.Receiver do
     window = Enum.slice(symbols, offset, @probe_length)
     {best_offset, best_corr} = find_best_phase_offset(window, @capture_probe_prefix)
 
-    {new_best, new_peak, new_peak_off} = if abs(best_corr) > 20 do
-      phase_correction = if best_corr > 0, do: best_offset, else: rem(best_offset + 4, 8)
-      phase_info = %{offset: phase_correction, correlation: best_corr}
-      {{:found, offset, nil, phase_info}, abs(best_corr), offset}
-    else
-      new_peak = if abs(best_corr) > peak_corr, do: abs(best_corr), else: peak_corr
-      new_off = if abs(best_corr) > peak_corr, do: offset, else: peak_offset
-      {best, new_peak, new_off}
-    end
+    {new_best, new_peak, new_peak_off} =
+      if abs(best_corr) > 20 do
+        phase_correction = if best_corr > 0, do: best_offset, else: rem(best_offset + 4, 8)
+        phase_info = %{offset: phase_correction, correlation: best_corr}
+        {{:found, offset, nil, phase_info}, abs(best_corr), offset}
+      else
+        new_peak = if abs(best_corr) > peak_corr, do: abs(best_corr), else: peak_corr
+        new_off = if abs(best_corr) > peak_corr, do: offset, else: peak_offset
+        {best, new_peak, new_off}
+      end
 
     case new_best do
       {:found, _, _, _} -> {new_best, new_peak, new_peak_off}
@@ -676,39 +786,48 @@ defmodule Minutewave.ALE.Receiver do
       Logger.info("[ALE RX] Deep WALE incomplete: #{length(data_symbols)} < #{min_data_symbols}")
       :incomplete
     else
-      data_symbols = if length(data_symbols) < @deep_data_symbols do
-        data_symbols ++ List.duplicate(0, @deep_data_symbols - length(data_symbols))
-      else
-        data_symbols
-      end
+      data_symbols =
+        if length(data_symbols) < @deep_data_symbols do
+          data_symbols ++ List.duplicate(0, @deep_data_symbols - length(data_symbols))
+        else
+          data_symbols
+        end
 
       sample_start = data_start * @samples_per_symbol
-      data_samples = Enum.slice(raw_samples, sample_start, @deep_data_symbols * @samples_per_symbol)
 
-      result = if length(data_samples) >= @deep_data_symbols * @samples_per_symbol do
-        demod = PhyModem.unified_demod_new(:psk8, @sample_rate)
-        PhyModem.unified_demod_set_block_size(demod, 999_999)
-        iq_pairs = PhyModem.unified_demod_iq(demod, data_samples)
+      data_samples =
+        Enum.slice(raw_samples, sample_start, @deep_data_symbols * @samples_per_symbol)
 
-        data_iq = Enum.take(iq_pairs, @deep_data_symbols)
+      result =
+        if length(data_samples) >= @deep_data_symbols * @samples_per_symbol do
+          demod = PhyModem.unified_demod_new(:psk8, @sample_rate)
+          PhyModem.unified_demod_set_block_size(demod, 999_999)
+          iq_pairs = PhyModem.unified_demod_iq(demod, data_samples)
 
-        if length(data_iq) >= min_data_symbols do
-          Logger.info("[ALE RX] Using soft I/Q decode path (#{length(data_iq)} I/Q pairs)")
-          decode_deep_wale_soft_iq(data_iq, rig_id)
+          data_iq = Enum.take(iq_pairs, @deep_data_symbols)
+
+          if length(data_iq) >= min_data_symbols do
+            Logger.info("[ALE RX] Using soft I/Q decode path (#{length(data_iq)} I/Q pairs)")
+            decode_deep_wale_soft_iq(data_iq, rig_id)
+          else
+            Logger.info(
+              "[ALE RX] Insufficient I/Q pairs (#{length(data_iq)}), falling back to hard decode"
+            )
+
+            decode_deep_wale_hard(data_symbols, rig_id)
+          end
         else
-          Logger.info("[ALE RX] Insufficient I/Q pairs (#{length(data_iq)}), falling back to hard decode")
+          Logger.info("[ALE RX] Insufficient raw samples for I/Q, using hard decode")
           decode_deep_wale_hard(data_symbols, rig_id)
         end
-      else
-        Logger.info("[ALE RX] Insufficient raw samples for I/Q, using hard decode")
-        decode_deep_wale_hard(data_symbols, rig_id)
-      end
 
       case result do
         {:ok, pdu, decode_metrics} ->
           remaining = Enum.drop(symbols, data_start + @deep_data_symbols)
           {:ok, pdu, remaining, decode_metrics}
-        :error -> :error
+
+        :error ->
+          :error
       end
     end
   end
@@ -724,14 +843,16 @@ defmodule Minutewave.ALE.Receiver do
         min_llr = Enum.min(llr_magnitudes, fn -> 0.0 end)
 
         deinterleaved = Encoding.deinterleave_soft(soft_dibits, 12, 16)
+
         case viterbi_decode_soft(deinterleaved) do
           {:ok, decoded_bits, terminal} ->
-            decode_metrics = Map.merge(terminal, %{
-              symbol_count: length(data_iq),
-              avg_llr: avg_llr,
-              min_llr: min_llr,
-              decode_path: :soft_iq
-            })
+            decode_metrics =
+              Map.merge(terminal, %{
+                symbol_count: length(data_iq),
+                avg_llr: avg_llr,
+                min_llr: min_llr,
+                decode_path: :soft_iq
+              })
 
             :telemetry.execute(
               [:minutemodem, :ale, :decode],
@@ -740,51 +861,81 @@ defmodule Minutewave.ALE.Receiver do
                 avg_llr: avg_llr,
                 min_llr: min_llr
               }),
-              %{rig_id: rig_id, waveform: :deep, decode_path: :soft_iq,
-                result: :ok, error_reason: nil}
+              %{
+                rig_id: rig_id,
+                waveform: :deep,
+                decode_path: :soft_iq,
+                result: :ok,
+                error_reason: nil
+              }
             )
 
             case bits_to_pdu(decoded_bits) do
-              {:ok, pdu} -> {:ok, pdu, decode_metrics}
+              {:ok, pdu} ->
+                {:ok, pdu, decode_metrics}
+
               {:error, reason} ->
                 Logger.info("[ALE RX] Soft decode PDU parse failed: #{inspect(reason)}")
                 :error
             end
+
           {:error, reason} ->
             :telemetry.execute(
               [:minutemodem, :ale, :decode],
-              %{symbol_count: length(data_iq), path_metric: 0.0,
-                path_metric_delta: 0.0, avg_llr: avg_llr, min_llr: min_llr},
-              %{rig_id: rig_id, waveform: :deep, decode_path: :soft_iq,
-                result: :error, error_reason: reason}
+              %{
+                symbol_count: length(data_iq),
+                path_metric: 0.0,
+                path_metric_delta: 0.0,
+                avg_llr: avg_llr,
+                min_llr: min_llr
+              },
+              %{
+                rig_id: rig_id,
+                waveform: :deep,
+                decode_path: :soft_iq,
+                result: :error,
+                error_reason: reason
+              }
             )
+
             Logger.info("[ALE RX] Soft Viterbi decode failed: #{inspect(reason)}")
             :error
         end
 
       {hard_dibits, _scrambler} ->
         deinterleaved = Encoding.deinterleave(hard_dibits, 12, 16)
+
         case viterbi_decode(deinterleaved) do
           {:ok, decoded_bits, terminal} ->
-            decode_metrics = Map.merge(terminal, %{
-              symbol_count: length(data_iq),
-              decode_path: :hard
-            })
+            decode_metrics =
+              Map.merge(terminal, %{
+                symbol_count: length(data_iq),
+                decode_path: :hard
+              })
 
             :telemetry.execute(
               [:minutemodem, :ale, :decode],
               Map.merge(terminal, %{symbol_count: length(data_iq)}),
-              %{rig_id: rig_id, waveform: :deep, decode_path: :hard,
-                result: :ok, error_reason: nil}
+              %{
+                rig_id: rig_id,
+                waveform: :deep,
+                decode_path: :hard,
+                result: :ok,
+                error_reason: nil
+              }
             )
 
             case bits_to_pdu(decoded_bits) do
-              {:ok, pdu} -> {:ok, pdu, decode_metrics}
+              {:ok, pdu} ->
+                {:ok, pdu, decode_metrics}
+
               {:error, reason} ->
                 Logger.info("[ALE RX] Hard fallback PDU parse failed: #{inspect(reason)}")
                 :error
             end
-          {:error, _} -> :error
+
+          {:error, _} ->
+            :error
         end
     end
   end
@@ -792,27 +943,32 @@ defmodule Minutewave.ALE.Receiver do
   defp decode_deep_wale_hard(data_symbols, rig_id) do
     {dibits, _scrambler} = DeepWale.decode_data(data_symbols)
     deinterleaved = Encoding.deinterleave(dibits, 12, 16)
+
     case viterbi_decode(deinterleaved) do
       {:ok, decoded_bits, terminal} ->
-        decode_metrics = Map.merge(terminal, %{
-          symbol_count: length(data_symbols),
-          decode_path: :hard
-        })
+        decode_metrics =
+          Map.merge(terminal, %{
+            symbol_count: length(data_symbols),
+            decode_path: :hard
+          })
 
         :telemetry.execute(
           [:minutemodem, :ale, :decode],
           Map.merge(terminal, %{symbol_count: length(data_symbols)}),
-          %{rig_id: rig_id, waveform: :deep, decode_path: :hard,
-            result: :ok, error_reason: nil}
+          %{rig_id: rig_id, waveform: :deep, decode_path: :hard, result: :ok, error_reason: nil}
         )
 
         case bits_to_pdu(decoded_bits) do
-          {:ok, pdu} -> {:ok, pdu, decode_metrics}
+          {:ok, pdu} ->
+            {:ok, pdu, decode_metrics}
+
           {:error, reason} ->
             Logger.info("[ALE RX] Hard decode PDU parse failed: #{inspect(reason)}")
             :error
         end
-      {:error, _} -> :error
+
+      {:error, _} ->
+        :error
     end
   end
 
@@ -830,7 +986,10 @@ defmodule Minutewave.ALE.Receiver do
     last_descrambled = Walsh.descramble_preamble(last_preamble_block)
     first_zeros = Enum.count(first_descrambled, &(&1 == 0))
     last_zeros = Enum.count(last_descrambled, &(&1 == 0))
-    Logger.info("[ALE RX] Fast phase coherence: preamble_start=#{first_zeros}/32, preamble_end=#{last_zeros}/32")
+
+    Logger.info(
+      "[ALE RX] Fast phase coherence: preamble_start=#{first_zeros}/32, preamble_end=#{last_zeros}/32"
+    )
 
     # Decode through Fast WALE path
     dibits = FastWale.decode_data(data_symbols)
@@ -842,18 +1001,21 @@ defmodule Minutewave.ALE.Receiver do
     case viterbi_decode(deinterleaved) do
       {:ok, decoded_bits, terminal} ->
         decoded_bytes = bits_to_bytes(Enum.drop(decoded_bits, -6))
-        Logger.info("[ALE RX] Fast Viterbi: #{length(decoded_bytes)} bytes, first 12: #{inspect(Enum.take(decoded_bytes, 12))}")
 
-        decode_metrics = Map.merge(terminal, %{
-          symbol_count: length(symbols),
-          decode_path: :fast
-        })
+        Logger.info(
+          "[ALE RX] Fast Viterbi: #{length(decoded_bytes)} bytes, first 12: #{inspect(Enum.take(decoded_bytes, 12))}"
+        )
+
+        decode_metrics =
+          Map.merge(terminal, %{
+            symbol_count: length(symbols),
+            decode_path: :fast
+          })
 
         :telemetry.execute(
           [:minutemodem, :ale, :decode],
           Map.merge(terminal, %{symbol_count: length(symbols)}),
-          %{rig_id: rig_id, waveform: :fast, decode_path: :fast,
-            result: :ok, error_reason: nil}
+          %{rig_id: rig_id, waveform: :fast, decode_path: :fast, result: :ok, error_reason: nil}
         )
 
         case bits_to_pdu(decoded_bits) do
@@ -863,10 +1025,14 @@ defmodule Minutewave.ALE.Receiver do
             consumed = data_start + num_blocks * 128
             remaining = Enum.drop(symbols, consumed)
             {:ok, pdu, remaining, decode_metrics}
+
           {:error, reason} ->
             type_names = %{0x68 => "LsuReq", 0x69 => "LsuConf", 0x6A => "LsuTerm"}
             first_byte = List.first(decoded_bytes) || 0
-            type_name = Map.get(type_names, first_byte, "Unknown(0x#{Integer.to_string(first_byte, 16)})")
+
+            type_name =
+              Map.get(type_names, first_byte, "Unknown(0x#{Integer.to_string(first_byte, 16)})")
+
             Logger.info("[ALE RX] Fast PDU failed: #{inspect(reason)}, type=#{type_name}")
             :error
         end
@@ -875,9 +1041,15 @@ defmodule Minutewave.ALE.Receiver do
         :telemetry.execute(
           [:minutemodem, :ale, :decode],
           %{symbol_count: length(symbols), path_metric: 0, path_metric_delta: 0},
-          %{rig_id: rig_id, waveform: :fast, decode_path: :fast,
-            result: :error, error_reason: reason}
+          %{
+            rig_id: rig_id,
+            waveform: :fast,
+            decode_path: :fast,
+            result: :error,
+            error_reason: reason
+          }
         )
+
         Logger.info("[ALE RX] Viterbi decode failed: #{inspect(reason)}")
         :error
     end
@@ -890,14 +1062,17 @@ defmodule Minutewave.ALE.Receiver do
   # Generator polynomials (same as Encoding/Decoding modules)
   @g1 0b1011011
   @g2 0b1111001
-  @num_states 64  # 2^(K-1)
+  # 2^(K-1)
+  @num_states 64
 
   import Bitwise
 
   defp viterbi_decode(dibits) do
-    initial_metrics = Map.new(0..(@num_states - 1), fn s ->
-      {s, if(s == 0, do: 0, else: 10000)}
-    end)
+    initial_metrics =
+      Map.new(0..(@num_states - 1), fn s ->
+        {s, if(s == 0, do: 0, else: 10000)}
+      end)
+
     initial_paths = Map.new(0..(@num_states - 1), fn s -> {s, []} end)
 
     {final_metrics, final_paths} =
@@ -911,13 +1086,16 @@ defmodule Minutewave.ALE.Receiver do
   end
 
   defp viterbi_decode_soft(soft_dibits) do
-    initial_metrics = Map.new(0..(@num_states - 1), fn s ->
-      {s, if(s == 0, do: 0.0, else: 100_000.0)}
-    end)
+    initial_metrics =
+      Map.new(0..(@num_states - 1), fn s ->
+        {s, if(s == 0, do: 0.0, else: 100_000.0)}
+      end)
+
     initial_paths = Map.new(0..(@num_states - 1), fn s -> {s, []} end)
 
     {final_metrics, final_paths} =
-      Enum.reduce(soft_dibits, {initial_metrics, initial_paths}, fn soft_dibit, {metrics, paths} ->
+      Enum.reduce(soft_dibits, {initial_metrics, initial_paths}, fn soft_dibit,
+                                                                    {metrics, paths} ->
         viterbi_step_soft(metrics, paths, soft_dibit)
       end)
 
@@ -931,7 +1109,9 @@ defmodule Minutewave.ALE.Receiver do
   # a larger delta means higher decode confidence.
   defp extract_terminal_metrics(final_metrics) do
     state0_metric = Map.get(final_metrics, 0, 0)
-    next_best = final_metrics
+
+    next_best =
+      final_metrics
       |> Enum.reject(fn {s, _} -> s == 0 end)
       |> Enum.map(fn {_, m} -> m end)
       |> Enum.min(fn -> state0_metric end)
@@ -996,7 +1176,7 @@ defmodule Minutewave.ALE.Receiver do
   end
 
   defp hamming_distance({a1, a2}, {b1, b2}) do
-    (if a1 == b1, do: 0, else: 1) + (if a2 == b2, do: 0, else: 1)
+    if(a1 == b1, do: 0, else: 1) + if a2 == b2, do: 0, else: 1
   end
 
   defp viterbi_step_soft(metrics, paths, {llr1, llr2}) do
@@ -1091,6 +1271,7 @@ defmodule Minutewave.ALE.Receiver do
     |> Macro.underscore()
     |> String.to_atom()
   end
+
   defp pdu_type_name(%{type: type}), do: type
   defp pdu_type_name(_), do: :unknown
 
@@ -1102,5 +1283,6 @@ defmodule Minutewave.ALE.Receiver do
       _ -> :unknown
     end
   end
+
   defp detect_waveform_from_symbols(_), do: :unknown
 end

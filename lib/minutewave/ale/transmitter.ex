@@ -18,6 +18,7 @@ defmodule Minutewave.ALE.Transmitter do
   alias Minutewave.Dsp.PhyModem
   alias Minutewave.Modem.Events
   alias Minutewave.Rig.Control
+  alias Minutewave.Audio
 
   @default_sample_rate 9600
 
@@ -102,18 +103,20 @@ defmodule Minutewave.ALE.Transmitter do
   # -------------------------------------------------------------------
 
   defp do_transmit(symbols, state) do
-    samples = PhyModem.unified_mod_modulate(state.modulator, symbols)
-    tail = PhyModem.unified_mod_flush(state.modulator)
-    all_samples = samples ++ tail
+    # Zero-copy modulate: symbols in, s16le PCM binary out (no per-sample lists).
+    body = PhyModem.unified_mod_modulate_bin(state.modulator, symbols)
+    tail = PhyModem.unified_mod_flush_bin(state.modulator)
+    binary = body <> tail
 
     PhyModem.unified_mod_reset(state.modulator)
 
-    duration_ms = length(all_samples) / state.sample_rate * 1000
-    Logger.info("ALE TX [#{state.rig_id}] #{length(symbols)} symbols -> #{length(all_samples)} samples (#{round(duration_ms)}ms)")
+    sample_count = div(byte_size(binary), 2)
+    duration_ms = sample_count / state.sample_rate * 1000
+    Logger.info("ALE TX [#{state.rig_id}] #{length(symbols)} symbols -> #{sample_count} samples (#{round(duration_ms)}ms)")
 
-    result = send_to_audio_pipeline(state.rig_id, all_samples, state.sample_rate)
+    result = send_to_audio_pipeline(state.rig_id, binary, state.sample_rate)
 
-    broadcast_tx_event(state.rig_id, length(symbols), length(all_samples), duration_ms)
+    broadcast_tx_event(state.rig_id, length(symbols), sample_count, duration_ms)
 
     result
   rescue
@@ -122,27 +125,19 @@ defmodule Minutewave.ALE.Transmitter do
       {:error, e}
   end
 
-  defp send_to_audio_pipeline(rig_id, samples, _sample_rate) do
-    # Convert samples to binary (s16le)
-    binary =
-      samples
-      |> Enum.map(fn s ->
-        clamped = max(-32768, min(32767, round(s)))
-        <<clamped::little-signed-16>>
-      end)
-      |> IO.iodata_to_binary()
+  defp send_to_audio_pipeline(rig_id, binary, sample_rate) when is_binary(binary) do
+    # Push to the configured audio backend (the producer->hardware link). On
+    # mobile this is the USB PCM backend, which enqueues to the DigiRig
+    # AudioTrack and keys/holds PTT for the duration via the Manager.
+    Minutewave.Audio.play_tx(rig_id, binary, sample_rate, [])
 
-    # Broadcast through Modem.Events - AudioPipeline will receive and route appropriately
+    # Also emit the legacy events/pg broadcasts for UI/telemetry/loopback.
     Events.broadcast(rig_id, {:modem, {:tx_audio, binary}})
+    Logger.debug("ALE TX [#{rig_id}] sent #{byte_size(binary)} bytes to audio backend")
+    broadcast(rig_id, {:tx_audio, rig_id, binary, sample_rate})
 
-    Logger.debug("ALE TX [#{rig_id}] sent #{byte_size(binary)} bytes to Modem.Events")
-
-    # Also broadcast to pg subscribers (for loopback testing, etc)
-    broadcast(rig_id, {:tx_audio, rig_id, binary, _sample_rate})
-
-    # Write debug file if configured
     if Application.get_env(:minutemodem_core, :debug_tx_audio, false) do
-      write_debug_wav(rig_id, binary, _sample_rate)
+      write_debug_wav(rig_id, binary, sample_rate)
     end
 
     :ok

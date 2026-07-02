@@ -2,7 +2,7 @@ defmodule Minutewave.ALE.Receiver do
   @moduledoc """
   ALE 4G Receiver - demodulates audio and decodes PDUs.
 
-  Receives audio samples from Rig.Audio (which gets them from
+  Receives audio samples from Minutewave.Audio (which gets them from
   SimnetBridge for simnet rigs, or from the soundcard for physical rigs),
   demodulates to symbols, decodes frames, and dispatches PDUs to the Link FSM.
 
@@ -51,7 +51,8 @@ defmodule Minutewave.ALE.Receiver do
   alias Minutewave.ALE.{Decoding, Encoding, Link, LQA, PDU}
   alias Minutewave.ALE.Waveform
   alias Minutewave.ALE.Waveform.{DeepWale, FastWale, Walsh}
-  alias Minutewave.Rig.{Audio, Control}
+  alias Minutewave.Audio
+  alias Minutewave.Rig.Control
 
   @sample_rate 9600
   @samples_per_symbol 4  # 9600 / 2400 = 4

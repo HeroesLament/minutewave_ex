@@ -234,13 +234,13 @@ defmodule Minutewave.Modem.RxFSM do
 
   # Handle RX audio from Rig.Audio pubsub (basic form)
   def no_carrier(:info, {:rx_audio, _rig_id, samples}, data) do
-    Logger.debug("[Modem.RxFSM] no_carrier got #{length(samples)} samples, PhyRx state: #{data.phy_rx.state}")
+    Logger.debug("[Modem.RxFSM] no_carrier got #{sample_count(samples)} samples, PhyRx state: #{data.phy_rx.state}")
     process_samples_internal(samples, data, :no_carrier)
   end
 
   # Handle RX audio with metadata (from simnet)
   def no_carrier(:info, {:rx_audio, _rig_id, samples, _metadata}, data) do
-    Logger.debug("[Modem.RxFSM] no_carrier got #{length(samples)} samples (with metadata), PhyRx state: #{data.phy_rx.state}")
+    Logger.debug("[Modem.RxFSM] no_carrier got #{sample_count(samples)} samples (with metadata), PhyRx state: #{data.phy_rx.state}")
     process_samples_internal(samples, data, :no_carrier)
   end
 
@@ -441,7 +441,29 @@ defmodule Minutewave.Modem.RxFSM do
   # Common Sample Processing
   # ============================================================================
 
-  defp process_samples_internal(samples, data, current_state) do
+  # Term-type-aware RX ingest.
+  #
+  # The hardware audio backend delivers s16le PCM as an Erlang **binary**
+  # (zero-copy from the AudioPcm bridge); simnet/loopback/test backends deliver
+  # a **list** of i16 samples. We dispatch on the term type so the hardware path
+  # crosses the NIF boundary as a binary (no boxed term per sample at 48 kHz)
+  # while the list path stays bit-compatible for existing tests. Both produce
+  # the same baseband I/Q downstream.
+  defp process_samples_internal(samples, data, current_state) when is_binary(samples) do
+    # Large batch (new transmission) -> reset demod for clean PLL acquisition.
+    # 2000 bytes == 1000 s16 samples (the list path's threshold).
+    if byte_size(samples) > 2000 do
+      PhyModem.unified_demod_reset(data.demod)
+    end
+
+    iq_samples = PhyModem.unified_demod_iq_bin(data.demod, samples)
+
+    {phy_rx, events} = PhyRx.process(data.phy_rx, iq_samples)
+    data = %{data | phy_rx: phy_rx}
+    handle_phy_events(events, data, current_state)
+  end
+
+  defp process_samples_internal(samples, data, current_state) when is_list(samples) do
     # For large sample batches (new transmission), reset demod for clean PLL acquisition
     if length(samples) > 1000 do
       PhyModem.unified_demod_reset(data.demod)
@@ -776,4 +798,9 @@ defmodule Minutewave.Modem.RxFSM do
   defp via_arbiter(rig_id) do
     {:via, Registry, {Minutewave.Modem.Registry, {rig_id, :arbiter}}}
   end
+
+  # Sample count for either delivery shape: s16le binary (2 bytes/sample) or a
+  # list of integers. Used only for debug logging.
+  defp sample_count(samples) when is_binary(samples), do: div(byte_size(samples), 2)
+  defp sample_count(samples) when is_list(samples), do: length(samples)
 end

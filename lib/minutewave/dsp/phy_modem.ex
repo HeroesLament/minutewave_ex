@@ -54,6 +54,13 @@ defmodule Minutewave.Dsp.PhyModem do
   def unified_mod_modulate(modulator, symbols),
     do: impl().unified_mod_modulate(modulator, symbols)
 
+  @doc """
+  Zero-copy TX hot path: modulate symbols, returning s16le PCM as an Erlang
+  binary instead of a list of samples.
+  """
+  def unified_mod_modulate_bin(modulator, symbols),
+    do: impl().unified_mod_modulate_bin(modulator, symbols)
+
   def unified_mod_modulate_mixed(modulator, tagged_symbols),
     do: impl().unified_mod_modulate_mixed(modulator, tagged_symbols)
 
@@ -65,6 +72,10 @@ defmodule Minutewave.Dsp.PhyModem do
 
   def unified_mod_flush(modulator),
     do: impl().unified_mod_flush(modulator)
+
+  @doc "Zero-copy flush: RRC filter tail as an s16le binary."
+  def unified_mod_flush_bin(modulator),
+    do: impl().unified_mod_flush_bin(modulator)
 
   def unified_mod_reset(modulator),
     do: impl().unified_mod_reset(modulator)
@@ -78,6 +89,15 @@ defmodule Minutewave.Dsp.PhyModem do
 
   def unified_demod_iq(demodulator, samples),
     do: impl().unified_demod_iq(demodulator, samples)
+
+  @doc """
+  Zero-copy RX hot path: demodulate s16le PCM (Erlang binary) to baseband
+  I/Q. Same result as `unified_demod_iq/2` but the input crosses the NIF
+  boundary as a binary instead of a list of integers, avoiding one boxed
+  term per sample at audio rate.
+  """
+  def unified_demod_iq_bin(demodulator, samples_bin),
+    do: impl().unified_demod_iq_bin(demodulator, samples_bin)
 
   def unified_demod_symbols(demodulator, samples),
     do: impl().unified_demod_symbols(demodulator, samples)

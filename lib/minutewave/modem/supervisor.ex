@@ -55,11 +55,13 @@ defmodule Minutewave.Modem.Supervisor do
        sample_rate: sample_rate,
        rig_type: rig_type},
 
-      # RX FSM
+      # RX FSM. Runs at the same native codec rate as TX — milwave-rs does all
+      # decimation/matched-filtering internally (sps = sample_rate/2400), so
+      # there is no separate 9600 demod rate and no resampler in the path.
       {Minutewave.Modem.RxFSM,
        rig_id: rig_id,
        bw_khz: bw_khz,
-       sample_rate: 9600}  # RX uses 9600 for demod
+       sample_rate: sample_rate}
     ]
 
     Supervisor.init(children, strategy: :one_for_all)

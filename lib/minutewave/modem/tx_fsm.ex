@@ -47,6 +47,7 @@ defmodule Minutewave.Modem.TxFSM do
   alias Minutewave.Modem.{Events, Arbiter}
   alias Minutewave.Modem110D.{Tx, Codec, Tables, Waveforms}
   alias Minutewave.Rig.Control
+  alias Minutewave.Audio
 
   # ============================================================================
   # State Data
@@ -491,9 +492,32 @@ defmodule Minutewave.Modem.TxFSM do
   defp send_audio(%{audio_sink: fun}, samples) when is_function(fun, 1) do
     fun.(samples)
   end
-  defp send_audio(%{rig_id: rig_id}, samples) do
-    # Default: broadcast to AudioPipeline via Events
-    Events.broadcast(rig_id, {:modem, {:tx_audio, samples}})
+  defp send_audio(%{rig_id: rig_id, sample_rate: sample_rate}, samples) do
+    # Push TX audio to the configured audio backend (Minutewave.Audio) as an
+    # s16le binary. This is the producer->hardware link: on mobile the backend
+    # is the USB PCM backend, which enqueues to the DigiRig AudioTrack. Packing
+    # to s16le here is one pass per transmission (not a hot path).
+    #
+    # Backends receive an s16le binary. The legacy {:modem, {:tx_audio, …}}
+    # Events broadcast is also emitted for any UI/telemetry subscribers.
+    #
+    # v2: have Modem110D.Tx.transmit return an s16le binary directly (via the
+    # unified_mod_modulate_bin path) so no packing pass is needed here either.
+    bin = samples_to_s16le(samples)
+    Minutewave.Audio.play_tx(rig_id, bin, sample_rate, [])
+    Events.broadcast(rig_id, {:modem, {:tx_audio, bin}})
+  end
+
+  # Pack a buffer of i16 samples (list, or already-binary) into an s16le binary.
+  defp samples_to_s16le(bin) when is_binary(bin), do: bin
+
+  defp samples_to_s16le(samples) when is_list(samples) do
+    samples
+    |> Enum.map(fn s ->
+      clamped = max(-32768, min(32767, round(s)))
+      <<clamped::little-signed-16>>
+    end)
+    |> IO.iodata_to_binary()
   end
 
   # ============================================================================

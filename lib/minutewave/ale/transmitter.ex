@@ -22,6 +22,14 @@ defmodule Minutewave.ALE.Transmitter do
 
   @default_sample_rate 9600
 
+  # PTT hang time after the last audio sample. `play_tx` queues PCM to the
+  # AudioTrack asynchronously, so the modulated burst starts playing slightly
+  # after we return and finishes ~one buffer later. We hold PTT for the computed
+  # playout duration plus this margin so the transmitter stays keyed across the
+  # entire burst (and a touch past it) instead of dropping PTT the instant the
+  # audio is merely *queued* — which transmitted only key/unkey clicks.
+  @tx_hang_ms 250
+
   # -------------------------------------------------------------------
   # Client API
   # -------------------------------------------------------------------
@@ -90,6 +98,14 @@ defmodule Minutewave.ALE.Transmitter do
       {:error, :busy} ->
         Logger.warning("ALE TX [#{state.rig_id}] rig TX busy, cannot transmit")
         {:reply, {:error, :tx_busy}, state}
+
+      # Any other acquire failure (e.g. :no_session when the modem audio session
+      # isn't open) must fail the transmit cleanly, not crash the Transmitter —
+      # an unmatched error here takes down the whole ALE stack via the Link's
+      # blocking call.
+      {:error, reason} ->
+        Logger.warning("ALE TX [#{state.rig_id}] cannot acquire TX: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -115,6 +131,13 @@ defmodule Minutewave.ALE.Transmitter do
     Logger.info("ALE TX [#{state.rig_id}] #{length(symbols)} symbols -> #{sample_count} samples (#{round(duration_ms)}ms)")
 
     result = send_to_audio_pipeline(state.rig_id, binary, state.sample_rate)
+
+    # Block until the queued audio has actually played out. play_tx is async
+    # (enqueues to the AudioTrack and returns immediately), so the caller would
+    # otherwise unkey PTT before a single tone leaves the DAC. Holding here keeps
+    # PTT keyed for the whole burst; the caller's release_tx then lands just
+    # after the last sample (plus @tx_hang_ms).
+    Process.sleep(round(duration_ms) + @tx_hang_ms)
 
     broadcast_tx_event(state.rig_id, length(symbols), sample_count, duration_ms)
 

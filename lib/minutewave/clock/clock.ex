@@ -121,6 +121,25 @@ defmodule Minutewave.Clock do
   end
 
   @doc """
+  Full status snapshot for display/telemetry: quality, uncertainty, the source
+  currently disciplining us (`"gnss"` / `"tod"` / `nil`), stratum, whether
+  peer-TOD is admissible, current protocol time, and whether we have ever been
+  disciplined (if not, we are on the OS wall-clock fallback).
+  """
+  @spec status() :: %{
+          quality: quality(),
+          uncertainty_ms: non_neg_integer() | :infinity,
+          source_name: String.t() | nil,
+          stratum: non_neg_integer() | nil,
+          tod_admissible: boolean(),
+          protocol_time_ms: integer(),
+          disciplined: boolean()
+        }
+  def status(server \\ @name) do
+    GenServer.call(server, :status)
+  end
+
+  @doc """
   Feed a GNSS (or other stratum-0 physical) fix. Always accepted — GNSS is the
   default authoritative source.
   """
@@ -182,6 +201,22 @@ defmodule Minutewave.Clock do
   def handle_call(:quality, _from, state) do
     mono = mono_ms()
     {:reply, {quality(state, mono), round_unc(current_uncertainty(state, mono))}, state}
+  end
+
+  def handle_call(:status, _from, state) do
+    mono = mono_ms()
+
+    reply = %{
+      quality: quality(state, mono),
+      uncertainty_ms: round_unc(current_uncertainty(state, mono)),
+      source_name: state.source_name,
+      stratum: state.stratum,
+      tod_admissible: state.tod_admissible,
+      protocol_time_ms: now_protocol_ms(state, mono),
+      disciplined: state.disciplined_mono_ms != nil
+    }
+
+    {:reply, reply, state}
   end
 
   def handle_call(:serve_fix, _from, state) do

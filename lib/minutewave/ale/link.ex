@@ -2253,6 +2253,14 @@ defmodule Minutewave.ALE.Link do
     catch
       :exit, {:noproc, _} -> {:error, :noproc}
       :exit, reason -> {:error, reason}
+      # A raised exception (not just a dead process) must also be contained:
+      # optional backends like SimnetBridge aren't merely *not running* on a
+      # physical-rig / mobile release — the module may not be compiled in at
+      # all, so the call raises UndefinedFunctionError (an :error-class raise,
+      # which the :exit clauses above don't catch). Left unguarded it crashes
+      # the Link FSM mid-scan. Treat any raise as a failed optional call.
+      :error, %UndefinedFunctionError{} -> {:error, :not_available}
+      kind, reason -> {:error, {kind, reason}}
     end
   end
 

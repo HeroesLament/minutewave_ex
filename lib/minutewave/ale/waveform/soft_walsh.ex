@@ -120,6 +120,9 @@ defmodule Minutewave.ALE.Waveform.SoftWalsh do
     require Logger
     alias Minutewave.ALE.Waveform.Scrambler
     scrambler = scrambler || Scrambler.Deep.new()
+    # Bound the iteration count before it reaches the Rust NIF — an unchecked
+    # count sizes native work and must not be attacker/caller controllable.
+    n_iterations = clamp_iterations(n_iterations)
 
     {descrambled_iq, final_scrambler, scramble_offsets} = descramble_iq(raw_iq_pairs, scrambler)
 
@@ -133,6 +136,9 @@ defmodule Minutewave.ALE.Waveform.SoftWalsh do
 
     {:turbo, hard_bits, soft_dibit_llrs, iteration_scores, final_scrambler}
   end
+
+  defp clamp_iterations(n) when is_integer(n) and n >= 1, do: min(n, 10)
+  defp clamp_iterations(_), do: @n_turbo_iterations
 
   # ═══════════════════════════════════════════════════════════════════
   # Per-block zero-forcing equalization

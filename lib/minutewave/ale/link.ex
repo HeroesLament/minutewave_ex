@@ -48,25 +48,30 @@ defmodule Minutewave.ALE.Link do
   # All-ones broadcast address (G.5.7.4 undirected TOD request Called Address).
   @broadcast_addr 0xFFFF
 
+  # Defaults per 188-141D Table G-II (Initial Network Parameters). Each of these
+  # is a configurable INP; the values here are the standard defaults and are
+  # overridden per-net from the operator's config (see resolve_scan_config).
   @default_timing %{
-    # Listen before transmit duration
-    t_lbt: 200,
-    # Listen before respond duration
-    t_lbr: 200,
-    # Radio tuning time
+    # Listen before transmit (INP tLBT, default 400 ms)
+    t_lbt: 400,
+    # Listen before respond (INP tLBR, default 400 ms)
+    t_lbr: 400,
+    # Network maximum tune time (INP ttune, default 40 ms)
     t_tune: 40,
-    # PDU processing + radio turnaround
+    # PDU processing + radio turnaround (Thandshake, G.5.5.11.3 constant, 100 ms)
     t_handshake: 100,
-    # Wait for response (must cover remote RX + processing + remote TX + our decode)
-    t_response: 5000,
-    # Wait for traffic after link setup
-    t_traffic: 3000,
-    # Link inactivity timeout
+    # Wait for response (INP tresponse, default 2 s)
+    t_response: 2_000,
+    # Wait for traffic after link setup (INP ttraffic, default 10 s)
+    t_traffic: 10_000,
+    # Link inactivity timeout (INP tactivity, default 30 s)
     t_activity: 30_000,
-    # Time to listen on each channel while scanning
-    scan_dwell_ms: 500,
-    # TTxOffset_TLC: delay after dwell start before transmitting (radio tuning settling)
-    t_tx_offset: 40
+    # Max network time uncertainty (INP tsync, default 36 ms) — feeds TTxOffsetTLC
+    t_sync: 36,
+    # TLC settling time (INP tTLC, default 13.33 ms) — feeds TTxOffsetTLC
+    t_tlc: 13.33,
+    # Per-channel scan dwell (sync: D=1350/SDS; async: dmin). Default = SDS 3.
+    scan_dwell_ms: 450
   }
 
   # Default channel set for scanning when no net is configured.
@@ -249,6 +254,10 @@ defmodule Minutewave.ALE.Link do
         channels: @default_channels,
         scan_index: 0,
         scan_mode: :ale_4g,
+        # Operator sync/async preference (:sync default | :async forces async).
+        # Must exist here so the `%{data | ...}` update in the scan/call handlers
+        # can set it. Read in sync_scan?/1.
+        scan_sync_pref: :sync,
         # Monotonic time when scan index 0 started
         scan_epoch_ms: nil,
         # Per-dwell sampled: clock quality permits sync scan (:locked|:holdover). Gated in sync_scan?/1
@@ -311,7 +320,10 @@ defmodule Minutewave.ALE.Link do
           "sounding=#{scan_config.sounding_enabled}"
       )
 
-      timing = %{data.timing | scan_dwell_ms: scan_config.scan_dwell_ms}
+      timing =
+        data.timing
+        |> Map.merge(scan_config.timing_overrides)
+        |> Map.put(:scan_dwell_ms, scan_config.scan_dwell_ms)
 
       new_data = %{
         data
@@ -320,6 +332,7 @@ defmodule Minutewave.ALE.Link do
           scan_index: 0,
           timing: timing,
           scan_mode: scan_config.scan_mode,
+          scan_sync_pref: scan_config.scan_sync_pref,
           sounding_schedule: Sounder.seed_schedule(Map.get(data, :initial_schedule, %{})),
           sounding_enabled: scan_config.sounding_enabled,
           sounding_interval_s: scan_config.sounding_interval_s,
@@ -363,7 +376,10 @@ defmodule Minutewave.ALE.Link do
         "ALE Link [#{data.rig_id}] sync call to 0x#{Integer.to_string(dest_addr, 16)} on #{format_freq(call_freq)} — entering scan to schedule"
       )
 
-      timing = %{data.timing | scan_dwell_ms: scan_config.scan_dwell_ms}
+      timing =
+        data.timing
+        |> Map.merge(scan_config.timing_overrides)
+        |> Map.put(:scan_dwell_ms, scan_config.scan_dwell_ms)
 
       pending = %{
         dest_addr: dest_addr,
@@ -384,6 +400,7 @@ defmodule Minutewave.ALE.Link do
           channels: scan_config.channels,
           scan_index: 0,
           scan_mode: scan_config.scan_mode,
+          scan_sync_pref: scan_config.scan_sync_pref,
           timing: timing,
           pending_call: pending
       }
@@ -554,8 +571,10 @@ defmodule Minutewave.ALE.Link do
     updated_pending =
       case data.pending_call do
         %{lbt_at_ms: nil, call_ch_index: call_ch_index} = pending ->
+          tx_offset = tx_offset_tlc(data.timing.scan_dwell_ms, pending.waveform, data.timing)
+
           lbt_at =
-            compute_lbt_time(epoch, call_ch_index, data.timing, n_channels, now_wall, now_mono)
+            compute_lbt_time(epoch, call_ch_index, data.timing, n_channels, now_wall, now_mono, tx_offset)
 
           Logger.info(
             "ALE Link [#{data.rig_id}] sync call scheduled: LBT in #{lbt_at - now_mono}ms for ch #{call_ch_index}"
@@ -724,6 +743,8 @@ defmodule Minutewave.ALE.Link do
       now_wall = Minutewave.Clock.protocol_time_ms()
       now_mono = System.monotonic_time(:millisecond)
 
+      tx_offset = tx_offset_tlc(data.timing.scan_dwell_ms, waveform, data.timing)
+
       lbt_at =
         compute_lbt_time(
           data.scan_epoch_ms,
@@ -731,7 +752,8 @@ defmodule Minutewave.ALE.Link do
           data.timing,
           length(data.channels),
           now_wall,
-          now_mono
+          now_mono,
+          tx_offset
         )
 
       time_until_lbt = lbt_at - now_mono
@@ -1804,7 +1826,12 @@ defmodule Minutewave.ALE.Link do
   # on the same net dwell on the same channel simultaneously.
   # Async: single-channel, ad-hoc, or free-running scan.
   defp sync_scan?(data) do
-    length(data.channels) > 1 and data.scan_mode in [:ale_4g, :ale_3g] and
+    # Operator preference gates sync: `:async` forces free-running scan even
+    # when the clock would permit lockstep. `:sync` (default) keeps the
+    # automatic behaviour — sync when clock + multichannel + 4G/3G allow, and
+    # it still degrades to async on its own if the clock authority is lost.
+    Map.get(data, :scan_sync_pref, :sync) != :async and
+      length(data.channels) > 1 and data.scan_mode in [:ale_4g, :ale_3g] and
       data.clock_sync_ok
   end
 
@@ -2040,6 +2067,33 @@ defmodule Minutewave.ALE.Link do
     ale_4g: 500
   }
 
+  # G.5.5.11.1 fixed constants (NOT operator INPs — these are protocol constants).
+  @t_odt_ms 50
+  @t_prop_max_ms 80
+  @preamble_fast_ms 120
+  @preamble_deep_ms 240
+
+  # Synchronous Dwell Speed → dwell (Table G-I: D = 1350 ms / SDS, SDS ∈ {1,2,3}).
+  # Table G-II default SDS is 3.
+  defp clamp_sds(sds) when is_integer(sds) and sds in 1..3, do: sds
+  defp clamp_sds(_), do: 3
+
+  # G.5.5.11.1 synchronous call TX offset. A synchronous LSU_Req transmission
+  # must begin TTxOffsetTLC after the start of the target dwell:
+  #
+  #   TTxOffsetTLC = max( 2·Tsync ,
+  #                       D/2 − (TTLC + Tpreamble + TODT + 2·TpropMax)/2 )
+  #
+  # The first arm keeps the TX late enough into the dwell that both stations
+  # overlap despite ±Tsync clock uncertainty; the second centers the exchange in
+  # the dwell. Tsync and TTLC are configurable INPs (read from the timing map);
+  # Tpreamble is waveform-dependent (Fast 120 ms / Deep 240 ms).
+  defp tx_offset_tlc(dwell_ms, waveform, timing) do
+    t_preamble = if waveform == :deep, do: @preamble_deep_ms, else: @preamble_fast_ms
+    arm2 = dwell_ms / 2 - (timing.t_tlc + t_preamble + @t_odt_ms + 2 * @t_prop_max_ms) / 2
+    round(max(2 * timing.t_sync, arm2))
+  end
+
   @doc false
   # Resolve the full scan configuration from options.
   #
@@ -2061,6 +2115,9 @@ defmodule Minutewave.ALE.Link do
     scan_mode = Keyword.get(opts, :scan_mode)
     net_id = Keyword.get(opts, :net_id)
     explicit_channels = Keyword.get(opts, :channels)
+    scan_sync_pref = Keyword.get(opts, :scan_sync_pref, :sync)
+    scan_sds = clamp_sds(Keyword.get(opts, :scan_sds, 3))
+    timing_overrides = collect_timing_overrides(opts)
 
     # Load net if specified
     net = if net_id, do: Map.get(data.nets || %{}, net_id), else: nil
@@ -2091,27 +2148,48 @@ defmodule Minutewave.ALE.Link do
           :ale_4g
       end
 
-    # Resolve dwell time — explicit > net timing > mode canonical > default
+    # Resolve dwell time. Synchronous and asynchronous scanning use different
+    # dwell definitions (188-141D G.4.1.2):
+    #
+    #   * Synchronous — the dwell is fixed by the Synchronous Dwell Speed (SDS)
+    #     per Table G-I: D = 1350 ms / SDS, SDS ∈ {1,2,3} → {1350, 675, 450} ms.
+    #     Operators pick SDS, not a free dwell; a free dwell would break lockstep.
+    #   * Asynchronous — the dwell is the Minimum Dwell Time INP (free ms), which
+    #     may be extended while evaluating an incoming signal.
     resolved_dwell =
-      cond do
-        explicit_dwell ->
-          explicit_dwell
-
-        net && get_in(net.timing_config, ["scan_dwell_ms"]) ->
-          net.timing_config["scan_dwell_ms"]
-
-        true ->
-          Map.get(@scan_mode_dwell, resolved_mode, data.timing.scan_dwell_ms)
+      if scan_sync_pref == :async do
+        cond do
+          explicit_dwell -> explicit_dwell
+          net && get_in(net.timing_config, ["scan_dwell_ms"]) -> net.timing_config["scan_dwell_ms"]
+          true -> Map.get(@scan_mode_dwell, resolved_mode, data.timing.scan_dwell_ms)
+        end
+      else
+        div(1350, scan_sds)
       end
 
     %{
       channels: channels,
       scan_dwell_ms: resolved_dwell,
       scan_mode: resolved_mode,
+      scan_sync_pref: scan_sync_pref,
+      timing_overrides: timing_overrides,
       sounding_enabled: resolve_sounding_enabled(net, opts),
       sounding_interval_s: resolve_sounding_interval(net, opts),
       sounding_waveform: resolve_sounding_waveform(net, opts)
     }
+  end
+
+  # The configurable timing INPs (Table G-II) that may arrive in scan/call opts.
+  # Only keys actually present are collected, so unset INPs keep their defaults.
+  @timing_inp_keys [:t_lbt, :t_lbr, :t_response, :t_traffic, :t_activity, :t_tune, :t_tlc, :t_sync]
+
+  defp collect_timing_overrides(opts) do
+    Enum.reduce(@timing_inp_keys, %{}, fn k, acc ->
+      case Keyword.get(opts, k) do
+        nil -> acc
+        v -> Map.put(acc, k, v)
+      end
+    end)
   end
 
   defp resolve_sounding_enabled(nil, opts), do: Keyword.get(opts, :sounding_enabled, false)
@@ -2204,8 +2282,10 @@ defmodule Minutewave.ALE.Link do
   #
   # epoch and now_wall are in wall-clock (os_time) milliseconds.
   # now_mono is in monotonic milliseconds.
-  # Returns a monotonic timestamp for lbt_at_ms.
-  defp compute_lbt_time(epoch, call_ch_index, timing, n_channels, now_wall, now_mono) do
+  # Returns a monotonic timestamp for lbt_at_ms. `tx_offset` is TTxOffsetTLC
+  # (G.5.5.11.1): the synchronous LSU_Req transmission must begin that many ms
+  # into the target dwell, so LBT (tune + listen) must complete at that instant.
+  defp compute_lbt_time(epoch, call_ch_index, timing, n_channels, now_wall, now_mono, tx_offset) do
     dwell_ms = timing.scan_dwell_ms
     cycle_len = n_channels * dwell_ms
     ms_into_cycle = rem_nonneg(now_wall - epoch, cycle_len)
@@ -2218,13 +2298,14 @@ defmodule Minutewave.ALE.Link do
         target_dwell_start_in_cycle + cycle_len - ms_into_cycle
       end
 
+    # TX begins tx_offset into the target dwell; LBT must finish just before it.
+    time_until_tx = time_until_target_dwell + tx_offset
     lbt_lead_time = timing.t_lbt + timing.t_tune
+    time_until_lbt = time_until_tx - lbt_lead_time
 
-    # If the target dwell is too soon for a full LBT, wait for the next cycle
-    time_until_lbt = time_until_target_dwell - lbt_lead_time
-
+    # If the LBT window for this cycle has already passed, wait one full cycle.
     if time_until_lbt <= 0 do
-      now_mono + time_until_target_dwell + cycle_len - lbt_lead_time
+      now_mono + time_until_tx + cycle_len - lbt_lead_time
     else
       now_mono + time_until_lbt
     end

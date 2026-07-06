@@ -249,6 +249,21 @@ defmodule Minutewave.Modem.TxFSM do
     :keep_state_and_data
   end
 
+  # Late / stray events land here after a TX has fully drained back to :flushed —
+  # e.g. a duplicate :tx_complete, or a {:port_ready} that arrives after we've
+  # already flushed. Without these clauses gen_statem raises a FunctionClauseError
+  # and the TxFSM crashes (seen during sound / LQA-exchange TX). Reply an error to
+  # any unexpected call so the caller can't hang; ignore everything else.
+  def flushed({:call, from}, event, _data) do
+    Logger.debug("[Modem.TxFSM] flushed: unexpected call #{inspect(event)}")
+    {:keep_state_and_data, [{:reply, from, {:error, :bad_event}}]}
+  end
+
+  def flushed(type, content, _data) do
+    Logger.debug("[Modem.TxFSM] flushed: ignoring stray #{inspect(type)} #{inspect(content)}")
+    :keep_state_and_data
+  end
+
   # ============================================================================
   # State: armed_port_not_ready (half-duplex, waiting for RX to complete)
   # ============================================================================

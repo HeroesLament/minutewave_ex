@@ -24,13 +24,20 @@ defmodule Minutewave.ALE.PDU do
   @lsu_type_term 0b010
   @lsu_type_status 0b011
 
-  # Utility PDU types (3 bits)
-  @util_type_tod 0b000
+  # Utility PDU subtypes. The Utility protocol (011, Table G-XI) shares its
+  # code across Message Header (G.5.6.2), TOD Response and Data Fill (G.5.7);
+  # they are disambiguated by the top 3 bits of the 5-bit Protocol-Specific
+  # field (the low 2 bits are V and M). Per Figures G-28 / G-32 / G-33.
+  @util_subtype_msg_hdr 0b000
+  @util_subtype_tod 0b101
 
   # CRC polynomial: x^16 + x^12 + x^8 + x^7 + x^4 + x^3 + x + 1
   # Represented as 0x9299 (bit-reversed form used in spec)
   @crc_poly 0x9299
   @crc_init 0xFFFF
+
+  # Every 4G PDU is a fixed 96-bit / 12-octet structure (Figure G-11).
+  @pdu_octets 12
 
   # -------------------------------------------------------------------
   # LSU Request
@@ -231,6 +238,38 @@ defmodule Minutewave.ALE.PDU do
   end
 
   # -------------------------------------------------------------------
+  # Message Header (Figure G-28)
+  # -------------------------------------------------------------------
+
+  defmodule MsgHdr do
+    @moduledoc """
+    Message Header PDU (MIL-STD-188-141D G.5.6.2, Figure G-28).
+
+    Leads a "stand-alone" message transmission (one not piggybacked on a link
+    setup PDU). Carries the WALE addresses of the sender and recipient; the
+    following Text/Binary Message PDUs are addressless and inherit their from/to
+    from this header. `M` is always 1 (message PDUs follow). The 4-octet
+    `purpose` is locally defined and not standardized.
+    """
+
+    defstruct [
+      :sender_addr,
+      :recipient_addr,
+      voice: false,
+      more: true,
+      purpose: <<0, 0, 0, 0>>
+    ]
+
+    @type t :: %__MODULE__{
+            sender_addr: non_neg_integer(),
+            recipient_addr: non_neg_integer(),
+            voice: boolean(),
+            more: boolean(),
+            purpose: binary()
+          }
+  end
+
+  # -------------------------------------------------------------------
   # Time of Day Response
   # -------------------------------------------------------------------
 
@@ -388,12 +427,33 @@ defmodule Minutewave.ALE.PDU do
     append_crc(payload)
   end
 
+  def encode(%MsgHdr{} = pdu) do
+    payload =
+      <<
+        # Byte 0: proto(3)=util + subtype(3)=msg_hdr(000) + v(1) + m(1)
+        @proto_util::3,
+        @util_subtype_msg_hdr::3,
+        bool_to_bit(pdu.voice)::1,
+        bool_to_bit(pdu.more)::1,
+        # Byte 1: reserved (Figure G-28 shows an all-zero second octet)
+        0::8,
+        # Bytes 2-3: sender WALE address
+        pdu.sender_addr::little-16,
+        # Bytes 4-5: recipient WALE address
+        pdu.recipient_addr::little-16,
+        # Bytes 6-9: purpose (locally defined, 4 octets)
+        binary_part(pdu.purpose <> <<0, 0, 0, 0>>, 0, 4)::binary-size(4)
+      >>
+
+    append_crc(payload)
+  end
+
   def encode(%TodResponse{} = pdu) do
     payload =
       <<
-        # Byte 0: proto(3)=util + util_type(3)=tod + v(1) + m(1)
+        # Byte 0: proto(3)=util + subtype(3)=tod(101) + v(1) + m(1)
         @proto_util::3,
-        @util_type_tod::3,
+        @util_subtype_tod::3,
         bool_to_bit(pdu.voice)::1,
         bool_to_bit(pdu.more)::1,
         # Byte 1: ec(2) + sync_sign(2) + sync_tq(3) + reserved(1)
@@ -414,6 +474,45 @@ defmodule Minutewave.ALE.PDU do
       >>
 
     append_crc(payload)
+  end
+
+  # -------------------------------------------------------------------
+  # Transmission (multi-PDU) encode/parse
+  # -------------------------------------------------------------------
+
+  @doc """
+  Encode a list of PDU structs into one transmission binary — the PDUs are
+  concatenated in order. A 4G transmission is `[addressed carrier PDU][message
+  PDUs...]`; the caller is responsible for setting the carrier PDU's `more`
+  (M) flag to true when message PDUs follow.
+  """
+  @spec encode_stream([struct()]) :: binary()
+  def encode_stream(pdus) when is_list(pdus) do
+    pdus |> Enum.map(&encode/1) |> IO.iodata_to_binary()
+  end
+
+  @doc """
+  Parse a received transmission binary into an ordered list of PDU structs.
+
+  The burst is split into fixed 12-octet PDUs and each is decoded (CRC checked).
+  Returns `{:ok, [pdu]}`, or `{:error, {:pdu, index, reason}}` on the first
+  block that fails to decode, or `{:error, {:trailing_octets, n}}` if the burst
+  length is not a whole number of PDUs.
+  """
+  @spec decode_stream(binary()) :: {:ok, [struct()]} | {:error, term()}
+  def decode_stream(bin) when is_binary(bin), do: decode_stream(bin, 0, [])
+
+  defp decode_stream(<<>>, _index, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp decode_stream(<<block::binary-size(@pdu_octets), rest::binary>>, index, acc) do
+    case decode(block) do
+      {:ok, pdu} -> decode_stream(rest, index + 1, [pdu | acc])
+      {:error, reason} -> {:error, {:pdu, index, reason}}
+    end
+  end
+
+  defp decode_stream(partial, _index, _acc) when byte_size(partial) > 0 do
+    {:error, {:trailing_octets, byte_size(partial)}}
   end
 
   # -------------------------------------------------------------------
@@ -547,7 +646,25 @@ defmodule Minutewave.ALE.PDU do
      }}
   end
 
-  defp decode_payload(<<@proto_util::3, @util_type_tod::3, v::1, m::1, rest::binary>>) do
+  defp decode_payload(<<@proto_util::3, @util_subtype_msg_hdr::3, v::1, m::1, rest::binary>>) do
+    <<
+      _reserved::8,
+      sender::little-16,
+      recipient::little-16,
+      purpose::binary-size(4)
+    >> = rest
+
+    {:ok,
+     %MsgHdr{
+       voice: bit_to_bool(v),
+       more: bit_to_bool(m),
+       sender_addr: sender,
+       recipient_addr: recipient,
+       purpose: purpose
+     }}
+  end
+
+  defp decode_payload(<<@proto_util::3, @util_subtype_tod::3, v::1, m::1, rest::binary>>) do
     <<
       ec::2,
       sync_sign::2,

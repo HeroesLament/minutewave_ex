@@ -536,7 +536,13 @@ defmodule Minutewave.ALE.Receiver do
         _ -> nil
       end
 
-    Enum.each(decoded_results, fn {pdu, metrics} ->
+    # 4G message PDUs (Text/Binary) are addressless payload riders — separate
+    # them from the addressed carrier/control PDUs, which drive the Link FSM +
+    # LQA. Messages are reassembled and emitted separately below.
+    {message_results, carrier_results} =
+      Enum.split_with(decoded_results, fn {pdu, _m} -> message_pdu?(pdu) end)
+
+    Enum.each(carrier_results, fn {pdu, metrics} ->
       Logger.info("ALE RX [#{state.rig_id}] decoded PDU: #{inspect(pdu)}")
 
       :telemetry.execute(
@@ -568,7 +574,72 @@ defmodule Minutewave.ALE.Receiver do
       Link.rx_pdu(state.rig_id, pdu, snr_field)
     end)
 
+    # Reassemble any 4G message (G.5.6) carried in this transmission and emit it
+    # on the rig event bus for the app's Chat layer.
+    emit_message(carrier_results, message_results, snr_db, state)
+
     state
+  end
+
+  defp message_pdu?(%PDU.TxtMessage{}), do: true
+  defp message_pdu?(%PDU.BinMessage{}), do: true
+  defp message_pdu?(_), do: false
+
+  # Reassemble the message PDUs and broadcast {:ale, :message, payload}. The
+  # from/to addresses come from the leading addressed carrier PDU (a Message
+  # Header for stand-alone, or an LSU for piggyback), since message PDUs carry
+  # no address of their own.
+  defp emit_message(_carriers, [], _snr_db, _state), do: :ok
+
+  defp emit_message(carriers, message_results, snr_db, state) do
+    msg_pdus = Enum.map(message_results, fn {pdu, _m} -> pdu end)
+    {from, to} = carrier_addresses(carriers)
+
+    result =
+      case msg_pdus do
+        [%PDU.BinMessage{} | _] ->
+          case Minutewave.ALE.Message.reassemble_binary(msg_pdus) do
+            {:ok, data} ->
+              {:ok, %{kind: :binary, from: from, to: to, data: data, parity_errors: 0, snr_db: snr_db}}
+
+            err ->
+              err
+          end
+
+        _ ->
+          case Minutewave.ALE.Message.reassemble_text(msg_pdus) do
+            {:ok, %{text: text, parity_errors: pe}} ->
+              {:ok, %{kind: :text, from: from, to: to, text: text, parity_errors: pe, snr_db: snr_db}}
+
+            err ->
+              err
+          end
+      end
+
+    case result do
+      {:ok, payload} ->
+        Logger.info(
+          "[ALE RX #{short(state.rig_id)}] 4G message from 0x#{addr_hex(from)}: #{inspect(Map.get(payload, :text) || Map.get(payload, :data))}"
+        )
+
+        broadcast(state.rig_id, {:ale, :message, payload})
+
+      {:error, reason} ->
+        Logger.info("[ALE RX #{short(state.rig_id)}] message reassembly failed: #{inspect(reason)}")
+    end
+  end
+
+  defp carrier_addresses([{%PDU.MsgHdr{} = h, _} | _]), do: {h.sender_addr, h.recipient_addr}
+  defp carrier_addresses([{%PDU.LsuReq{} = l, _} | _]), do: {l.caller_addr, l.called_addr}
+  defp carrier_addresses([{%PDU.LsuConf{} = l, _} | _]), do: {l.caller_addr, l.called_addr}
+  defp carrier_addresses(_), do: {nil, nil}
+
+  defp addr_hex(nil), do: "????"
+  defp addr_hex(a), do: Integer.to_string(a, 16)
+
+  defp broadcast(rig_id, message) do
+    group = {:minutemodem, :rig, rig_id}
+    for pid <- :pg.get_members(:minutemodem_pg, group), do: send(pid, message)
   end
 
   defp safe_get_frequency(rig_id) do
@@ -641,7 +712,7 @@ defmodule Minutewave.ALE.Receiver do
         frame_samples = Enum.drop(raw_samples, sample_offset)
 
         case decode_frame(corrected, frame_samples, state.rig_id) do
-          {:ok, pdu, remaining, decode_metrics} ->
+          {:ok, pdus, remaining, decode_metrics} ->
             # Merge probe-level metrics with decode-level metrics for LQA
             combined_metrics =
               Map.merge(decode_metrics, %{
@@ -654,7 +725,10 @@ defmodule Minutewave.ALE.Receiver do
             {final_remaining, more_results, final_state} =
               find_frames(remaining, remaining_samples, state)
 
-            {final_remaining, [{pdu, combined_metrics} | more_results], final_state}
+            # A single transmission may carry several PDUs (carrier + message
+            # PDUs); each becomes a decoded result carrying the same metrics.
+            pdu_results = Enum.map(pdus, fn p -> {p, combined_metrics} end)
+            {final_remaining, pdu_results ++ more_results, final_state}
 
           :incomplete ->
             Logger.info(
@@ -822,9 +896,9 @@ defmodule Minutewave.ALE.Receiver do
         end
 
       case result do
-        {:ok, pdu, decode_metrics} ->
+        {:ok, pdus, decode_metrics} ->
           remaining = Enum.drop(symbols, data_start + @deep_data_symbols)
-          {:ok, pdu, remaining, decode_metrics}
+          {:ok, pdus, remaining, decode_metrics}
 
         :error ->
           :error
@@ -870,9 +944,9 @@ defmodule Minutewave.ALE.Receiver do
               }
             )
 
-            case bits_to_pdu(decoded_bits) do
-              {:ok, pdu} ->
-                {:ok, pdu, decode_metrics}
+            case bits_to_pdus(decoded_bits) do
+              {:ok, pdus} ->
+                {:ok, pdus, decode_metrics}
 
               {:error, reason} ->
                 Logger.info("[ALE RX] Soft decode PDU parse failed: #{inspect(reason)}")
@@ -925,9 +999,9 @@ defmodule Minutewave.ALE.Receiver do
               }
             )
 
-            case bits_to_pdu(decoded_bits) do
-              {:ok, pdu} ->
-                {:ok, pdu, decode_metrics}
+            case bits_to_pdus(decoded_bits) do
+              {:ok, pdus} ->
+                {:ok, pdus, decode_metrics}
 
               {:error, reason} ->
                 Logger.info("[ALE RX] Hard fallback PDU parse failed: #{inspect(reason)}")
@@ -958,9 +1032,9 @@ defmodule Minutewave.ALE.Receiver do
           %{rig_id: rig_id, waveform: :deep, decode_path: :hard, result: :ok, error_reason: nil}
         )
 
-        case bits_to_pdu(decoded_bits) do
-          {:ok, pdu} ->
-            {:ok, pdu, decode_metrics}
+        case bits_to_pdus(decoded_bits) do
+          {:ok, pdus} ->
+            {:ok, pdus, decode_metrics}
 
           {:error, reason} ->
             Logger.info("[ALE RX] Hard decode PDU parse failed: #{inspect(reason)}")
@@ -1018,13 +1092,13 @@ defmodule Minutewave.ALE.Receiver do
           %{rig_id: rig_id, waveform: :fast, decode_path: :fast, result: :ok, error_reason: nil}
         )
 
-        case bits_to_pdu(decoded_bits) do
-          {:ok, pdu} ->
+        case bits_to_pdus(decoded_bits) do
+          {:ok, pdus} ->
             # Estimate consumed symbols (data + probes)
             num_blocks = div(length(dibits) * 2 + 127, 128)
             consumed = data_start + num_blocks * 128
             remaining = Enum.drop(symbols, consumed)
-            {:ok, pdu, remaining, decode_metrics}
+            {:ok, pdus, remaining, decode_metrics}
 
           {:error, reason} ->
             type_names = %{0x68 => "LsuReq", 0x69 => "LsuConf", 0x6A => "LsuTerm"}
@@ -1227,6 +1301,19 @@ defmodule Minutewave.ALE.Receiver do
       PDU.decode(pdu_bytes)
     else
       {:error, :invalid_length}
+    end
+  end
+
+  # Decode ALL consecutive valid PDUs from a frame's bit payload. A 4G
+  # transmission may concatenate several PDUs (e.g. a carrier PDU followed by
+  # 4G message PDUs); this recovers the whole list, stopping at trailing FEC
+  # padding. Returns {:ok, [pdu, ...]} or {:error, :invalid_length} if none.
+  defp bits_to_pdus(bits) do
+    bytes = bits |> Enum.drop(-6) |> bits_to_bytes() |> :erlang.list_to_binary()
+
+    case PDU.decode_valid(bytes) do
+      [] -> {:error, :invalid_length}
+      pdus -> {:ok, pdus}
     end
   end
 

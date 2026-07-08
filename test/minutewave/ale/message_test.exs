@@ -234,4 +234,36 @@ defmodule Minutewave.ALE.MessageTest do
       assert {:error, {:pdu, 1, {:crc_mismatch, _, _}}} = PDU.decode_stream(p0 <> corrupt)
     end
   end
+
+  describe "PDU.decode_valid (lenient frame-payload decode — RX seam)" do
+    test "recovers all PDUs from a clean transmission and reassembles" do
+      hdr = %PDU.MsgHdr{sender_addr: 1, recipient_addr: 2}
+      body = "multi-PDU decode_valid test message body over the air"
+      {:ok, msgs} = Message.fragment_text(body)
+      decoded = PDU.decode_valid(PDU.encode_stream([hdr | msgs]))
+
+      assert length(decoded) == length(msgs) + 1
+      assert [%PDU.MsgHdr{} | rest] = decoded
+      assert {:ok, %{text: ^body}} = Message.reassemble_text(rest)
+    end
+
+    test "stops at trailing FEC/flush padding (< 12 octets)" do
+      {:ok, msgs} = Message.fragment_text("hi there friend")
+      good = PDU.encode_stream(msgs)
+      decoded = PDU.decode_valid(good <> <<0xAA, 0xBB, 0xCC, 0xDD, 0xEE>>)
+      assert length(decoded) == length(msgs)
+    end
+
+    test "stops at the first CRC-failed block" do
+      {:ok, [m0, m1]} = Message.fragment_text("ABCDEFGHI")
+      <<head::binary-size(11), crc>> = PDU.encode(m1)
+      corrupt = <<head::binary, bxor(crc, 0xFF)>>
+      assert [decoded_first] = PDU.decode_valid(PDU.encode(m0) <> corrupt)
+      assert %PDU.TxtMessage{} = decoded_first
+    end
+
+    test "returns [] for fewer than 12 octets" do
+      assert PDU.decode_valid(<<1, 2, 3>>) == []
+    end
+  end
 end

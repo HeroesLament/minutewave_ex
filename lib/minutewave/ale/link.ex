@@ -38,7 +38,7 @@ defmodule Minutewave.ALE.Link do
 
   require Logger
 
-  alias Minutewave.ALE.{PDU, Waveform, Receiver}
+  alias Minutewave.ALE.{PDU, Waveform, Receiver, Message}
   alias Minutewave.ALE.LQA
   alias Minutewave.ALE.LQA.Sounder
   alias Minutewave.Rig.Control
@@ -188,6 +188,25 @@ defmodule Minutewave.ALE.Link do
   """
   def get_state(rig_id) do
     GenStateMachine.call(via(rig_id), :get_state)
+  end
+
+  @doc """
+  Send a 4G text message over the currently active link (G.5.6).
+
+  Valid only while `:linked`. The message is addressed to the current
+  `remote_addr` (an individual or multipoint-group address), fragmented into
+  Text Message PDUs behind a Message Header, transmitted on the link, and the
+  inactivity timer is reset so chatting keeps the link alive. Returns `:ok`,
+  `{:error, :not_linked}`, or a `Message.fragment_text/1` error such as
+  `{:error, :non_ascii}` or `{:error, {:too_long, _, _}}`.
+  """
+  def send_message(rig_id, text) when is_binary(text) do
+    case get_state(rig_id) do
+      {:linked, _info} -> GenStateMachine.call(via(rig_id), {:send_message, text})
+      _ -> {:error, :not_linked}
+    end
+  catch
+    :exit, _ -> {:error, :not_linked}
   end
 
   @doc """
@@ -433,6 +452,11 @@ defmodule Minutewave.ALE.Link do
 
   def idle({:call, from}, :get_state, _data) do
     {:keep_state_and_data, [{:reply, from, {:idle, nil}}]}
+  end
+
+  # Messaging is only valid on an active link; reject if the link raced away.
+  def idle({:call, from}, {:send_message, _text}, _data) do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_linked}}]}
   end
 
   def idle({:call, from}, {:sound, opts}, data) do
@@ -1685,6 +1709,40 @@ defmodule Minutewave.ALE.Link do
 
   def linked(:cast, :activity, data) do
     {:keep_state_and_data, [{:state_timeout, data.timing.t_activity, :activity_timeout}]}
+  end
+
+  # Send a 4G text message on the active link (G.5.6). Fragments the text into
+  # a Message Header + Text Message PDUs, transmits the concatenated
+  # transmission, and re-arms the inactivity timer (chatting = activity).
+  def linked({:call, from}, {:send_message, text}, data) do
+    case Message.fragment_text(text) do
+      {:ok, msg_pdus} ->
+        hdr = %PDU.MsgHdr{sender_addr: data.self_addr, recipient_addr: data.remote_addr}
+        tx_binary = PDU.encode_stream([hdr | msg_pdus])
+        waveform = data.waveform || :fast
+
+        symbols =
+          Waveform.assemble_frame(tx_binary,
+            waveform: waveform,
+            include_probe: true,
+            capture_probe_count: 1,
+            preamble_count: 1
+          )
+
+        Logger.info(
+          "ALE Link [#{data.rig_id}] TX message to 0x#{Integer.to_string(data.remote_addr, 16)}: " <>
+            "#{byte_size(tx_binary)} bytes, #{length(msg_pdus)} msg PDU(s)"
+        )
+
+        transmit_frame(data.rig_id, symbols)
+        broadcast_event(data.rig_id, :message_sent, %{to: data.remote_addr, text: text})
+
+        {:keep_state_and_data,
+         [{:reply, from, :ok}, {:state_timeout, data.timing.t_activity, :activity_timeout}]}
+
+      {:error, reason} ->
+        {:keep_state_and_data, [{:reply, from, {:error, reason}}]}
+    end
   end
 
   def linked({:call, from}, :get_state, data) do

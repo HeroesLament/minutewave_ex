@@ -515,6 +515,25 @@ defmodule Minutewave.ALE.PDU do
     {:error, {:trailing_octets, byte_size(partial)}}
   end
 
+  @doc """
+  Decode as many consecutive valid 12-octet PDUs as possible, stopping at the
+  first block that fails to decode (bad CRC / unknown type) or when fewer than
+  12 octets remain. Lenient counterpart to `decode_stream/1`, for demodulated
+  frame payloads that may carry trailing FEC/flush padding after the PDUs.
+  Returns a (possibly empty) list of PDU structs.
+  """
+  @spec decode_valid(binary()) :: [struct()]
+  def decode_valid(bin) when is_binary(bin), do: do_decode_valid(bin, [])
+
+  defp do_decode_valid(<<block::binary-size(@pdu_octets), rest::binary>>, acc) do
+    case decode(block) do
+      {:ok, pdu} -> do_decode_valid(rest, [pdu | acc])
+      {:error, _} -> Enum.reverse(acc)
+    end
+  end
+
+  defp do_decode_valid(_partial, acc), do: Enum.reverse(acc)
+
   # -------------------------------------------------------------------
   # Decoding
   # -------------------------------------------------------------------
